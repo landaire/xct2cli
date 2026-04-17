@@ -134,6 +134,10 @@ struct RecordArgs {
     /// `KEY=VALUE` env vars forwarded to the launched binary; repeat for many.
     #[arg(long = "env", short = 'e', value_name = "KEY=VALUE")]
     env: Vec<String>,
+    /// Remove an existing `.trace` bundle at `--output` before recording.
+    /// xctrace itself errors on existing bundles.
+    #[arg(long, short = 'f')]
+    force: bool,
     /// Binary to launch, followed by its args after `--`.
     #[arg(required = true, last = true)]
     target: Vec<OsString>,
@@ -193,6 +197,12 @@ struct AnnotateArgs {
     /// of each other share one snippet.
     #[arg(long, default_value_t = 4)]
     context: u32,
+    /// Heat-bar scale. `function` (default) normalises to the hottest
+    /// instruction in the function being annotated. `trace` normalises
+    /// to the hottest single PC anywhere in the trace, so bars are
+    /// comparable across `annotate` runs on different functions.
+    #[arg(long, value_enum, default_value_t = CliBarScale::Function)]
+    bar_scale: CliBarScale,
     /// Overlay a CPU-Counters metric (per-PC delta sum) instead of raw
     /// sample counts. The index matches the `[N] <name>` legend printed
     /// by `xct2cli events`. Requires a CPU Counters trace.
@@ -224,6 +234,12 @@ enum CliAnnotateMode {
     Instructions,
     Source,
     Interleaved,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum CliBarScale {
+    Function,
+    Trace,
 }
 
 impl From<CliAnnotateMode> for AnnotateMode {
@@ -288,6 +304,10 @@ struct HotspotsArgs {
     /// Hex (`0x...`) or decimal. When omitted, auto-detected from kdebug.
     #[arg(long, value_parser = parse_u64)]
     slide: Option<u64>,
+    /// Keep only PCs whose resolved function name contains this substring
+    /// (case-insensitive). Useful for cutting out stdlib / system noise.
+    #[arg(long)]
+    filter: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -315,10 +335,11 @@ fn run_callgraph(args: CallgraphArgs, palette: Palette) -> anyhow::Result<()> {
         Some(b) => Some(b),
         None => infer_binary_from_toc(&bundle).unwrap_or(None),
     };
+    let dsym = resolve_dsym(binary.as_deref(), args.dsym);
     let mut builder = CallgraphBuilder::new(&bundle)
         .top(args.top)
         .binary(binary)
-        .dsym(args.dsym)
+        .dsym(dsym)
         .slide(slide_mode(args.slide))
         .function(args.function);
     if let Some(pid) = args.pid {
@@ -405,9 +426,6 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("missing target binary after `--`"))?;
     let target_args: Vec<OsString> = iter.collect();
     let bin_path = PathBuf::from(bin_os);
-    if !bin_path.exists() {
-        anyhow::bail!("target binary does not exist: {}", bin_path.display());
-    }
     let env: Vec<(String, String)> = args
         .env
         .into_iter()
@@ -417,6 +435,19 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("--env expects KEY=VALUE, got {kv:?}"))
         })
         .collect::<anyhow::Result<_>>()?;
+
+    if args.force {
+        let out_path = std::path::Path::new(args.output.as_str());
+        if out_path.exists() {
+            std::fs::remove_dir_all(out_path)
+                .or_else(|_| std::fs::remove_file(out_path))
+                .with_context(|| format!("removing existing {}", args.output))?;
+        }
+    }
+
+    if !bin_path.exists() {
+        anyhow::bail!("target binary does not exist: {}", bin_path.display());
+    }
 
     let xctrace = Xctrace::discover();
     xctrace
@@ -439,9 +470,10 @@ fn run_counters(args: CountersArgs, palette: Palette) -> anyhow::Result<()> {
         Some(b) => Some(b),
         None => infer_binary_from_toc(&bundle).unwrap_or(None),
     };
+    let dsym = resolve_dsym(binary.as_deref(), args.dsym);
     builder = builder
         .binary(binary)
-        .dsym(args.dsym)
+        .dsym(dsym)
         .slide(slide_mode(args.slide));
     let report = builder.run().context("building counter report")?;
     if args.json {
@@ -460,30 +492,56 @@ fn run_annotate(args: AnnotateArgs, palette: Palette) -> anyhow::Result<()> {
         None => infer_binary_from_toc(&bundle)?
             .ok_or_else(|| anyhow::anyhow!("no --binary and TOC has no usable process path"))?,
     };
+    let dsym = resolve_dsym(Some(&binary), args.dsym.clone());
     let opts = AnnotateOptions {
         function: args.function.clone(),
         binary,
-        dsym: args.dsym.clone(),
+        dsym,
         slide: slide_mode(args.slide),
         pid: args.pid.map(Pid::new),
         weight: args.weight(),
     };
+    let weight_for_max = args.weight();
     let func = annotate(&bundle, opts).context("annotating function")?;
     if args.json {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &func)?;
         println!();
     } else {
+        let bar_scale_max = match args.bar_scale {
+            CliBarScale::Function => None,
+            CliBarScale::Trace => {
+                Some(trace_wide_max(&bundle, &weight_for_max, args.pid.map(Pid::new)).unwrap_or(0))
+            }
+        };
         let render_opts = AnnotateRenderOptions {
             show_zero: args.show_zero,
             source_root: args.source_root,
             mode: args.mode.into(),
             colored: palette.colored,
             context: args.context,
+            bar_scale_max,
         };
         let text = func.render(&render_opts)?;
         print!("{}", text);
     }
     Ok(())
+}
+
+fn trace_wide_max(bundle: &TraceBundle, weight: &Weight, pid: Option<Pid>) -> Option<u64> {
+    match weight {
+        Weight::Samples => bundle
+            .pc_samples(pid)
+            .ok()
+            .and_then(|v| v.into_iter().map(|s| s.samples).max()),
+        Weight::Metric { index } => bundle
+            .per_pc_metric_deltas(pid, *index)
+            .ok()
+            .and_then(|m| m.into_values().max()),
+        Weight::PmiEvent { name } => bundle
+            .per_pc_pmi_count(pid, name)
+            .ok()
+            .and_then(|m| m.into_values().max()),
+    }
 }
 
 fn run_slide(args: SlideArgs) -> anyhow::Result<()> {
@@ -503,7 +561,8 @@ fn run_slide(args: SlideArgs) -> anyhow::Result<()> {
     let pcs = bundle
         .pc_samples(args.pid.map(Pid::new))
         .context("collecting PC samples")?;
-    let dwarf = args.dsym.as_deref().unwrap_or(binary.as_path());
+    let resolved_dsym = resolve_dsym(Some(binary.as_path()), args.dsym);
+    let dwarf = resolved_dsym.as_deref().unwrap_or(binary.as_path());
     let candidates = info.enumerate_slides(&pcs, dwarf);
     let take: Vec<_> = candidates.into_iter().take(args.top).collect();
 
@@ -618,10 +677,12 @@ fn run_hotspots(args: HotspotsArgs, palette: Palette) -> anyhow::Result<()> {
         Some(b) => Some(b),
         None => infer_binary_from_toc(&bundle).unwrap_or(None),
     };
+    let dsym = resolve_dsym(binary.as_deref(), args.dsym);
     builder = builder
         .binary(binary)
-        .dsym(args.dsym)
-        .slide(slide_mode(args.slide));
+        .dsym(dsym)
+        .slide(slide_mode(args.slide))
+        .filter(args.filter);
     let report = builder.run().context("building hotspot report")?;
     if args.json {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
@@ -630,6 +691,23 @@ fn run_hotspots(args: HotspotsArgs, palette: Palette) -> anyhow::Result<()> {
         print!("{}", report.to_text(palette));
     }
     Ok(())
+}
+
+/// macOS convention puts the dSYM at `<binary>.dSYM` next to the binary.
+/// If the user didn't pass `--dsym` explicitly and that path exists, use it.
+fn resolve_dsym(binary: Option<&std::path::Path>, explicit: Option<PathBuf>) -> Option<PathBuf> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    let bin = binary?;
+    let mut candidate = bin.as_os_str().to_owned();
+    candidate.push(".dSYM");
+    let candidate = PathBuf::from(candidate);
+    if candidate.is_dir() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 fn infer_binary_from_toc(bundle: &TraceBundle) -> anyhow::Result<Option<PathBuf>> {

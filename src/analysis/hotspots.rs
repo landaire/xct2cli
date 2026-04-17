@@ -75,6 +75,7 @@ pub struct HotspotsBuilder<'a> {
     binary: Option<PathBuf>,
     dsym: Option<PathBuf>,
     slide: SlideMode,
+    filter: Option<String>,
 }
 
 impl<'a> HotspotsBuilder<'a> {
@@ -88,7 +89,16 @@ impl<'a> HotspotsBuilder<'a> {
             binary: None,
             dsym: None,
             slide: SlideMode::default(),
+            filter: None,
         }
+    }
+
+    /// Substring filter on the resolved function name. Applied after
+    /// symbolication, before truncating to `top`. Useful for cutting
+    /// out stdlib/system noise.
+    pub fn filter(mut self, substring: Option<String>) -> Self {
+        self.filter = substring;
+        self
     }
 
     pub fn binary(mut self, path: Option<PathBuf>) -> Self {
@@ -207,7 +217,12 @@ impl<'a> HotspotsBuilder<'a> {
             })
             .collect();
         top_pcs.sort_by(|a, b| b.samples.cmp(&a.samples));
-        top_pcs.truncate(self.top_n);
+        // If no filter, truncate immediately to avoid symbolicating PCs
+        // we won't keep. With a filter we have to symbolicate everything
+        // before we know what survives.
+        if self.filter.is_none() {
+            top_pcs.truncate(self.top_n);
+        }
 
         if self.binary.is_some() || self.dsym.is_some() {
             let slide = match &self.slide {
@@ -254,6 +269,17 @@ impl<'a> HotspotsBuilder<'a> {
                     h.line = frame.line;
                 }
             }
+        }
+
+        if let Some(needle) = &self.filter {
+            let needle_lower = needle.to_lowercase();
+            top_pcs.retain(|h| {
+                h.function
+                    .as_deref()
+                    .map(|f| f.to_lowercase().contains(&needle_lower))
+                    .unwrap_or(false)
+            });
+            top_pcs.truncate(self.top_n);
         }
 
         Ok(HotspotReport {
