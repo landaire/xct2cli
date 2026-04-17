@@ -106,7 +106,7 @@ fn render_interleaved(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) ->
                     .or_insert_with(|| read_source(f, opts.source_root.as_deref()));
                 let snippet_line = text.as_deref().and_then(|t| nth_line(t, l));
                 match snippet_line {
-                    Some(s) => format!("{}:{}  {}", short_path(f), l, s.trim_end()),
+                    Some(s) => format!("{}:{}  {}", short_path(f), l, s.trim()),
                     None => format!("{}:{}", short_path(f), l),
                 }
             }
@@ -174,7 +174,7 @@ fn write_source_blocks(out: &mut String, func: &AnnotatedFunction, opts: &Annota
         let Some(display_text) = take_lines(&text, display_start, display_end) else {
             continue;
         };
-        let display_text = display_text.to_string();
+        let display_text = dedent_block(display_text);
         let display_text_static: &'static str = Box::leak(display_text.into_boxed_str());
 
         let mut snippet = Snippet::source(display_text_static)
@@ -199,6 +199,39 @@ fn write_source_blocks(out: &mut String, func: &AnnotatedFunction, opts: &Annota
             Group::with_title(Level::NOTE.primary_title(string_static(&title))).element(snippet);
         let _ = writeln!(out, "{}", renderer.render(&[group]));
     }
+}
+
+/// Strip the leading whitespace of the first non-empty line from every
+/// subsequent line, preserving sub-block indentation. Lines whose own
+/// leading whitespace is shorter than the first line's are left
+/// untouched (defensive — shouldn't happen in normal Rust source).
+fn dedent_block(text: &str) -> String {
+    let indent = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .unwrap_or(0);
+    if indent == 0 {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut first = true;
+    for line in text.lines() {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        let leading = line.len() - line.trim_start().len();
+        if leading >= indent {
+            out.push_str(&line[indent..]);
+        } else {
+            out.push_str(line.trim_start());
+        }
+    }
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 struct InstructionGroup<'a> {
