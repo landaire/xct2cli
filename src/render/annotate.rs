@@ -27,6 +27,10 @@ pub struct AnnotateRenderOptions {
     pub source_root: Option<PathBuf>,
     pub mode: AnnotateMode,
     pub colored: bool,
+    /// Lines of source context shown above/below each hot-line cluster
+    /// in the source-snippet view. Hot lines within `2 * context` lines
+    /// of each other share one snippet; further apart, they split.
+    pub context: u32,
 }
 
 impl AnnotatedFunction {
@@ -229,45 +233,67 @@ fn write_source_blocks(out: &mut String, func: &AnnotatedFunction, opts: &Annota
     } else {
         Renderer::plain()
     };
+    let context = opts.context.max(1);
+    let cluster_gap = context.saturating_mul(2);
     for (file, lines) in blocks {
         let Some(text) = read_source(&file, opts.source_root.as_deref()) else {
             let _ = writeln!(out, "  (source unavailable: {file})");
             continue;
         };
         let max_samples = lines.iter().map(|(_, s)| *s).max().unwrap_or(0);
-        let min_line = lines.iter().map(|(l, _)| *l).min().unwrap_or(1);
-        let max_line = lines.iter().map(|(l, _)| *l).max().unwrap_or(1);
-        let pad = 2u32;
-        let display_start = min_line.saturating_sub(pad).max(1);
-        let display_end = max_line + pad;
-        let Some(display_text) = take_lines(&text, display_start, display_end) else {
-            continue;
-        };
-        let display_text = dedent_block(display_text);
-        let display_text_static: &'static str = Box::leak(display_text.into_boxed_str());
-
-        let mut snippet = Snippet::source(display_text_static)
-            .path(string_static(&file))
-            .line_start(display_start as usize)
-            .fold(false);
-        for (line, samples) in &lines {
-            let Some(span) = line_byte_range(display_text_static, *line, display_start) else {
+        for cluster in cluster_hot_lines(&lines, cluster_gap) {
+            let min_line = cluster.first().map(|(l, _)| *l).unwrap_or(1);
+            let max_line = cluster.last().map(|(l, _)| *l).unwrap_or(1);
+            let display_start = min_line.saturating_sub(context).max(1);
+            let display_end = max_line + context;
+            let Some(display_text) = take_lines(&text, display_start, display_end) else {
                 continue;
             };
-            let label = format!("{} {}", samples, func.weight_label);
-            let kind = if max_samples > 0 && samples * 2 >= max_samples {
-                AnnotationKind::Primary
-            } else {
-                AnnotationKind::Context
-            };
-            snippet = snippet.annotation(kind.span(span).label(string_static(&label)));
-        }
+            let display_text = dedent_block(display_text);
+            let display_text_static: &'static str = Box::leak(display_text.into_boxed_str());
 
-        let title = format!("hot lines in {}", short_path(&file));
-        let group =
-            Group::with_title(Level::NOTE.primary_title(string_static(&title))).element(snippet);
-        let _ = writeln!(out, "{}", renderer.render(&[group]));
+            let mut snippet = Snippet::source(display_text_static)
+                .path(string_static(&file))
+                .line_start(display_start as usize)
+                .fold(false);
+            for (line, samples) in &cluster {
+                let Some(span) = line_byte_range(display_text_static, *line, display_start)
+                else {
+                    continue;
+                };
+                let label = format!("{} {}", samples, func.weight_label);
+                let kind = if max_samples > 0 && samples * 2 >= max_samples {
+                    AnnotationKind::Primary
+                } else {
+                    AnnotationKind::Context
+                };
+                snippet = snippet.annotation(kind.span(span).label(string_static(&label)));
+            }
+
+            let title = format!("hot lines in {}", short_path(&file));
+            let group =
+                Group::with_title(Level::NOTE.primary_title(string_static(&title))).element(snippet);
+            let _ = writeln!(out, "{}", renderer.render(&[group]));
+        }
     }
+}
+
+/// Group sorted-by-line hot entries into runs that are within `max_gap`
+/// of each other. Each cluster gets its own source snippet so distant
+/// hot lines don't drag hundreds of unrelated lines into one block.
+fn cluster_hot_lines(lines: &[(u32, u64)], max_gap: u32) -> Vec<Vec<(u32, u64)>> {
+    let mut sorted = lines.to_vec();
+    sorted.sort_by_key(|(l, _)| *l);
+    let mut clusters: Vec<Vec<(u32, u64)>> = Vec::new();
+    for entry in sorted {
+        match clusters.last_mut() {
+            Some(c) if entry.0.saturating_sub(c.last().unwrap().0) <= max_gap => {
+                c.push(entry);
+            }
+            _ => clusters.push(vec![entry]),
+        }
+    }
+    clusters
 }
 
 /// Strip the leading whitespace of the first non-empty line from every

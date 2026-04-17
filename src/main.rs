@@ -160,6 +160,12 @@ struct AnnotateArgs {
     /// `interleaved`: source line headers grouping the asm that came from each.
     #[arg(long, value_enum, default_value_t = CliAnnotateMode::Instructions)]
     mode: CliAnnotateMode,
+
+    /// Lines of source context shown above/below each hot-line cluster
+    /// in the source-snippet view. Hot lines within `2 * context` lines
+    /// of each other share one snippet.
+    #[arg(long, default_value_t = 4)]
+    context: u32,
     /// Overlay a CPU-Counters metric (per-PC delta sum) instead of raw
     /// sample counts. The index matches the `[N] <name>` legend printed
     /// by `xct2cli events`. Requires a CPU Counters trace.
@@ -419,6 +425,7 @@ fn run_annotate(args: AnnotateArgs, palette: Palette) -> anyhow::Result<()> {
             source_root: args.source_root,
             mode: args.mode.into(),
             colored: palette.colored,
+            context: args.context,
         };
         let text = func.render(&render_opts)?;
         print!("{}", text);
