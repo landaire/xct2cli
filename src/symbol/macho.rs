@@ -38,11 +38,15 @@ pub struct Symbolicator {
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolicatedFrame {
     pub address: RuntimePc,
+    /// The deepest-inlined function this PC actually belongs to — i.e.
+    /// the source the compiler labels the instruction as coming from.
     pub function: Option<String>,
     pub file: Option<String>,
     pub line: Option<u32>,
     pub column: Option<u32>,
-    pub inlined: Vec<InlinedFrame>,
+    /// Outer call sites that inlined this PC, closest-out first. Empty
+    /// when not inlined; the last entry is the concrete binary function.
+    pub inlined_into: Vec<InlinedFrame>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,7 +76,7 @@ impl Symbolicator {
             file: None,
             line: None,
             column: None,
-            inlined: Vec::new(),
+            inlined_into: Vec::new(),
         };
         let Some(loader) = &self.loader else {
             return Ok(frame);
@@ -82,41 +86,47 @@ impl Symbolicator {
         };
         let probe_raw = probe.raw();
 
-        if let Some(sym) = loader.find_symbol_info(probe_raw) {
-            frame.function = Some(demangle(sym.name()));
-        }
-
+        // addr2line yields frames innermost-first: the very first frame
+        // is the deepest inlined function (what the instruction actually
+        // belongs to), and each subsequent frame is the call site that
+        // inlined the previous one. The last frame is the outermost
+        // concrete binary function.
         let mut iter = loader
             .find_frames(probe_raw)
             .map_err(|e| Error::Addr2Line(e.to_string()))?;
-        let mut innermost: Option<addr2line::Frame<'_, _>> = None;
-        let mut inlined: Vec<InlinedFrame> = Vec::new();
+        let mut frames: Vec<addr2line::Frame<'_, _>> = Vec::new();
         while let Some(f) = iter.next().map_err(|e| Error::Addr2Line(e.to_string()))? {
-            if let Some(prev) = innermost.take() {
-                inlined.push(InlinedFrame {
-                    function: prev.function.as_ref().and_then(demangled_function),
-                    file: prev
-                        .location
-                        .as_ref()
-                        .and_then(|l| l.file.map(str::to_string)),
-                    line: prev.location.as_ref().and_then(|l| l.line),
-                });
-            }
-            innermost = Some(f);
+            frames.push(f);
         }
-        if let Some(f) = innermost {
-            if frame.function.is_none()
-                && let Some(fun) = f.function.as_ref()
-            {
+
+        if let Some(innermost) = frames.first() {
+            if let Some(fun) = innermost.function.as_ref() {
                 frame.function = demangled_function(fun);
             }
-            if let Some(loc) = f.location {
+            if let Some(loc) = innermost.location.as_ref() {
                 frame.file = loc.file.map(str::to_string);
                 frame.line = loc.line;
                 frame.column = loc.column;
             }
         }
-        frame.inlined = inlined;
+
+        if frame.function.is_none()
+            && let Some(sym) = loader.find_symbol_info(probe_raw)
+        {
+            frame.function = Some(demangle(sym.name()));
+        }
+
+        for outer in frames.iter().skip(1) {
+            frame.inlined_into.push(InlinedFrame {
+                function: outer.function.as_ref().and_then(demangled_function),
+                file: outer
+                    .location
+                    .as_ref()
+                    .and_then(|l| l.file.map(str::to_string)),
+                line: outer.location.as_ref().and_then(|l| l.line),
+            });
+        }
+
         Ok(frame)
     }
 }

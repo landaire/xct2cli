@@ -110,31 +110,54 @@ fn render_interleaved(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) ->
         if total == 0 && !opts.show_zero {
             continue;
         }
-        let header = match (&group.file, group.line) {
-            (Some(f), Some(l)) => {
-                let text = source_cache
-                    .entry(f.clone())
-                    .or_insert_with(|| read_source(f, opts.source_root.as_deref()));
-                let snippet_line = text.as_deref().and_then(|t| nth_line(t, l));
-                let loc = format!("{}:{}", short_path(f), l);
-                match snippet_line {
-                    Some(s) => format!("{}  {}", pal.path().style(loc), s.trim()),
-                    None => format!("{}", pal.path().style(loc)),
-                }
-            }
-            _ => format!("{}", pal.dim().style("(no source mapping)")),
-        };
         let group_intensity = intensity(total, max_samples);
-        let _ = writeln!(
-            out,
-            "{header}    {}",
-            pal.heat(group_intensity).style(format!(
-                "[{} insns, {} {}]",
-                group.instructions.len(),
-                total,
-                func.weight_label
-            )),
-        );
+        let stats = pal.heat(group_intensity).style(format!(
+            "[{} {} / {} insns]",
+            total,
+            func.weight_label,
+            group.instructions.len(),
+        ));
+        let inlined_label = group_inlined_label(&group);
+
+        // Header line: stats + identity + (optional inlining note).
+        match (&group.file, group.line) {
+            (Some(f), Some(l)) => {
+                let loc = pal.path().style(format!("{}:{}", short_path(f), l));
+                let func_part = group
+                    .function
+                    .as_deref()
+                    .map(|fn_name| format!("  {}", pal.function().style(fn_name)))
+                    .unwrap_or_default();
+                let inline_part = inlined_label
+                    .as_deref()
+                    .map(|s| format!("    {}", pal.dim().style(s)))
+                    .unwrap_or_default();
+                let _ = writeln!(out, "{stats}{func_part}  {loc}{inline_part}");
+            }
+            _ => {
+                let inline_part = inlined_label
+                    .as_deref()
+                    .map(|s| format!("    {}", pal.dim().style(s)))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "{stats}  {}{inline_part}",
+                    pal.dim().style("(no source mapping)")
+                );
+            }
+        }
+
+        // Source code on its own indented line, trimmed.
+        if let (Some(f), Some(l)) = (&group.file, group.line) {
+            let text = source_cache
+                .entry(f.clone())
+                .or_insert_with(|| read_source(f, opts.source_root.as_deref()));
+            if let Some(src) = text.as_deref().and_then(|t| nth_line(t, l)) {
+                let _ = writeln!(out, "    {}", src.trim());
+            }
+        }
+
+        // Instructions, indented further.
         for ins in group.instructions {
             if ins.samples == 0 && !opts.show_zero {
                 continue;
@@ -144,7 +167,7 @@ fn render_interleaved(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) ->
             let heat = pal.heat(intensity);
             let _ = writeln!(
                 out,
-                "      {}  {}  0x{:012x}  {} {}",
+                "        {}  {}  0x{:012x}  {} {}",
                 heat.style(format!("{:>5}", ins.samples)),
                 heat.style(format!("{:<10}", bar)),
                 ins.runtime_address.raw(),
@@ -283,6 +306,7 @@ fn dedent_block(text: &str) -> String {
 struct InstructionGroup<'a> {
     file: Option<String>,
     line: Option<u32>,
+    function: Option<String>,
     instructions: Vec<&'a crate::analysis::AnnotatedInstruction>,
 }
 
@@ -291,19 +315,42 @@ fn group_consecutive_by_source(
 ) -> Vec<InstructionGroup<'_>> {
     let mut out: Vec<InstructionGroup<'_>> = Vec::new();
     for ins in insns {
-        let key = (ins.file.clone(), ins.line);
+        let key = (ins.file.clone(), ins.line, ins.function.clone());
         match out.last_mut() {
-            Some(last) if (last.file.clone(), last.line) == key => {
+            Some(last)
+                if (last.file.clone(), last.line, last.function.clone()) == key =>
+            {
                 last.instructions.push(ins);
             }
             _ => out.push(InstructionGroup {
                 file: key.0,
                 line: key.1,
+                function: key.2,
                 instructions: vec![ins],
             }),
         }
     }
     out
+}
+
+/// Returns a one-liner like `inlined into MatchFinder::process at process:182`
+/// when the instructions in this group come from inlined code, else `None`.
+/// Uses the *innermost outer* call site (the function that directly inlined
+/// us), since that's the most useful "where this came from" hint.
+fn group_inlined_label(group: &InstructionGroup<'_>) -> Option<String> {
+    let first = group.instructions.first()?;
+    let outer = first.inlined_into.first()?;
+    let func = outer.function.as_deref()?;
+    let func_short = func.rsplit("::").next().unwrap_or(func);
+    match (outer.file.as_deref(), outer.line) {
+        (Some(file), Some(line)) => Some(format!(
+            "inlined into {} at {}:{}",
+            func,
+            short_path(file),
+            line
+        )),
+        _ => Some(format!("inlined into {}", func_short)),
+    }
 }
 
 fn nth_line(text: &str, n: u32) -> Option<&str> {

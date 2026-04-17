@@ -19,6 +19,7 @@ use crate::analysis::SlideMode;
 use crate::error::Error;
 use crate::error::Result;
 use crate::symbol::BinaryInfo;
+use crate::symbol::InlinedFrame;
 use crate::symbol::Symbolicator;
 use crate::symbol::SymbolicatorOptions;
 use crate::trace::TraceBundle;
@@ -67,9 +68,16 @@ pub struct AnnotatedInstruction {
     pub mnemonic: String,
     pub operands: String,
     pub samples: u64,
+    /// Innermost source location: where the compiler says this
+    /// instruction's code actually came from (after inlining).
     pub file: Option<String>,
     pub line: Option<u32>,
     pub column: Option<u32>,
+    /// Innermost function name (possibly an inlined function).
+    pub function: Option<String>,
+    /// Outer call sites that inlined this code, closest-out first. Empty
+    /// when not inlined.
+    pub inlined_into: Vec<InlinedFrame>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +177,11 @@ pub fn annotate(bundle: &TraceBundle, opts: AnnotateOptions) -> Result<Annotated
             file: frame.as_ref().and_then(|f| f.file.clone()),
             line: frame.as_ref().and_then(|f| f.line),
             column: frame.as_ref().and_then(|f| f.column),
+            function: frame.as_ref().and_then(|f| f.function.clone()),
+            inlined_into: frame
+                .as_ref()
+                .map(|f| f.inlined_into.clone())
+                .unwrap_or_default(),
         });
     }
 
