@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::PathBuf;
 
@@ -7,6 +8,7 @@ use annotate_snippets::Group;
 use annotate_snippets::Level;
 use annotate_snippets::Renderer;
 use annotate_snippets::Snippet;
+use owo_colors::Style;
 
 use crate::analysis::AnnotatedFunction;
 use crate::error::Result;
@@ -48,6 +50,7 @@ fn render_instructions(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -
     let mut out = String::new();
     write_header(&mut out, func, opts);
     let pal = Palette::new(opts.colored);
+    let hot_colors = build_hot_line_colors(func, pal);
 
     let max_samples = func
         .instructions
@@ -62,7 +65,19 @@ fn render_instructions(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -
         let intensity = intensity(ins.samples, max_samples);
         let bar = bar_str(ins.samples, max_samples);
         let loc = match (&ins.file, ins.line) {
-            (Some(f), Some(l)) => format!("  // {}:{}", short_path(f), l),
+            (Some(f), Some(l)) => {
+                let marker = hot_colors.get(&(f.clone(), l)).copied();
+                let line_part = match marker {
+                    Some(style) => format!("{}", style.style(format!(":{}", l))),
+                    None => format!("{}", pal.path().style(format!(":{}", l))),
+                };
+                format!(
+                    "  {} {}{}",
+                    pal.path().style("//"),
+                    pal.path().style(short_path(f)),
+                    line_part
+                )
+            }
             _ => String::new(),
         };
         let heat = pal.heat(intensity);
@@ -74,7 +89,7 @@ fn render_instructions(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -
             ins.runtime_address.raw(),
             ins.mnemonic,
             ins.operands,
-            pal.path().style(loc),
+            loc,
         );
     }
 
@@ -84,14 +99,16 @@ fn render_instructions(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -
         pal.header()
             .style(format!("source hot-spots ({}):", func.weight_label))
     );
-    write_source_blocks(&mut out, func, opts);
+    write_source_blocks(&mut out, func, opts, &hot_colors);
     Ok(out)
 }
 
 fn render_source_only(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -> Result<String> {
     let mut out = String::new();
     write_header(&mut out, func, opts);
-    write_source_blocks(&mut out, func, opts);
+    let pal = Palette::new(opts.colored);
+    let hot_colors = build_hot_line_colors(func, pal);
+    write_source_blocks(&mut out, func, opts, &hot_colors);
     Ok(out)
 }
 
@@ -226,7 +243,12 @@ fn bar_str(value: u64, max: u64) -> String {
     "#".repeat(n)
 }
 
-fn write_source_blocks(out: &mut String, func: &AnnotatedFunction, opts: &AnnotateRenderOptions) {
+fn write_source_blocks(
+    out: &mut String,
+    func: &AnnotatedFunction,
+    opts: &AnnotateRenderOptions,
+    hot_colors: &HashMap<(String, u32), Style>,
+) {
     let blocks = group_by_source(func);
     let renderer = if opts.colored {
         Renderer::styled()
@@ -261,7 +283,12 @@ fn write_source_blocks(out: &mut String, func: &AnnotatedFunction, opts: &Annota
                 else {
                     continue;
                 };
-                let label = format!("{} {}", samples, func.weight_label);
+                let marker = hot_colors.get(&(file.clone(), *line)).copied();
+                let line_tag = match marker {
+                    Some(style) => format!("{}", style.style(format!(":{}", line))),
+                    None => format!(":{}", line),
+                };
+                let label = format!("{}  {} {}", line_tag, samples, func.weight_label);
                 let kind = if max_samples > 0 && samples * 2 >= max_samples {
                     AnnotationKind::Primary
                 } else {
@@ -276,6 +303,29 @@ fn write_source_blocks(out: &mut String, func: &AnnotatedFunction, opts: &Annota
             let _ = writeln!(out, "{}", renderer.render(&[group]));
         }
     }
+}
+
+/// Assign a stable color from `Palette::line_marker` to every hot source
+/// line in the function. Iterates files in the order returned by
+/// `group_by_source` (alphabetical by file path) and lines ascending,
+/// so the asm overlay and the source snippet always agree on which
+/// color belongs to which line.
+fn build_hot_line_colors(
+    func: &AnnotatedFunction,
+    pal: Palette,
+) -> HashMap<(String, u32), Style> {
+    let mut out: HashMap<(String, u32), Style> = HashMap::new();
+    let mut idx = 0usize;
+    for (file, lines) in group_by_source(func) {
+        let mut sorted: Vec<u32> = lines.iter().map(|(l, _)| *l).collect();
+        sorted.sort();
+        sorted.dedup();
+        for line in sorted {
+            out.insert((file.clone(), line), pal.line_marker(idx));
+            idx += 1;
+        }
+    }
+    out
 }
 
 /// Group sorted-by-line hot entries into runs that are within `max_gap`

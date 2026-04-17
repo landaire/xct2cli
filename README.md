@@ -107,9 +107,16 @@ then the asm:
           931  ##########  0x10250e378  ldr w15, [x22, x11, lsl #2]
 ```
 
-(`--mode source` collapses to just the `annotate-snippets` source-line
-callouts; `--mode instructions` is the asm-first default with a
-source-snippet block at the end.)
+The default `--mode instructions` is asm-first: every sampled
+instruction with its sample count + heat bar + source-line comment,
+followed by an `annotate-snippets` block per source file showing the
+hot lines in context (hot-line clusters more than `2 * --context` lines
+apart split into separate snippets):
+
+![Default annotate output: asm with sample heat bar + source snippets](img/instructions_mode.png)
+
+`--mode source` collapses to just the `annotate-snippets` source-line
+callouts.
 
 ## Per-instruction cache miss attribution (CPU Counters trace)
 

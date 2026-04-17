@@ -97,4 +97,29 @@ impl Palette {
         }
         Style::new().bold().underline()
     }
+
+    /// Cycling palette for marking hot source lines so the same line in
+    /// the asm overlay and in the source snippet share a color. Hues
+    /// spaced ~36° apart (skipping pure red — that's the heat ramp).
+    /// Uses truecolor; terminals that lack it fall back via owo-colors
+    /// to the nearest 256-color match.
+    pub fn line_marker(self, index: usize) -> Style {
+        if !self.colored {
+            return Style::new();
+        }
+        const PALETTE: &[(u8, u8, u8)] = &[
+            (0x4d, 0xb8, 0xff), // sky blue
+            (0xff, 0x6b, 0x9d), // pink
+            (0xa3, 0xe6, 0x35), // lime
+            (0xff, 0xa6, 0x4d), // orange
+            (0xc2, 0x9b, 0xff), // purple
+            (0x6b, 0xff, 0xea), // teal
+            (0xff, 0xd7, 0x00), // gold
+            (0x4d, 0xe6, 0xa6), // spring green
+            (0xe6, 0x5b, 0xb7), // magenta
+            (0x6b, 0x5b, 0xe6), // indigo
+        ];
+        let (r, g, b) = PALETTE[index % PALETTE.len()];
+        Style::new().truecolor(r, g, b).bold()
+    }
 }
