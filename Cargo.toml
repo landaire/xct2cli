@@ -39,3 +39,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional =
 rustc-demangle = "0.1.27"
 cpp_demangle = "0.5.1"
 capstone = "0.14.0"
+owo-colors = "4.3.0"

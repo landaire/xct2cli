@@ -19,6 +19,8 @@ use xct2cli::analysis::Weight;
 use xct2cli::analysis::annotate;
 use xct2cli::render::AnnotateMode;
 use xct2cli::render::AnnotateRenderOptions;
+use xct2cli::render::ColorMode;
+use xct2cli::render::Palette;
 use xct2cli::symbol::BinaryInfo;
 use xct2cli::trace::TraceBundle;
 
@@ -32,8 +34,31 @@ struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
 
+    /// Color output: `auto` (default; on if stdout is a TTY and
+    /// `NO_COLOR` is unset), `always`, `never`.
+    #[arg(long, global = true, value_enum, default_value_t = CliColor::Auto)]
+    color: CliColor,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
+enum CliColor {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl From<CliColor> for ColorMode {
+    fn from(c: CliColor) -> Self {
+        match c {
+            CliColor::Auto => ColorMode::Auto,
+            CliColor::Always => ColorMode::Always,
+            CliColor::Never => ColorMode::Never,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -237,13 +262,14 @@ struct HotspotsArgs {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
+    let palette = Palette::new(ColorMode::from(cli.color).resolve());
 
     match cli.command {
-        Command::Toc(args) => run_toc(args),
-        Command::Hotspots(args) => run_hotspots(args),
+        Command::Toc(args) => run_toc(args, palette),
+        Command::Hotspots(args) => run_hotspots(args, palette),
         Command::Slide(args) => run_slide(args),
-        Command::Annotate(args) => run_annotate(args),
-        Command::Counters(args) => run_counters(args),
+        Command::Annotate(args) => run_annotate(args, palette),
+        Command::Counters(args) => run_counters(args, palette),
         Command::Record(args) => run_record(args),
         Command::Events(args) => run_events(args),
     }
@@ -341,7 +367,7 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_counters(args: CountersArgs) -> anyhow::Result<()> {
+fn run_counters(args: CountersArgs, palette: Palette) -> anyhow::Result<()> {
     let bundle = TraceBundle::open(&args.trace).context("opening trace bundle")?;
     let mut builder = CountersBuilder::new(&bundle).top(args.top);
     if let Some(pid) = args.pid {
@@ -363,12 +389,12 @@ fn run_counters(args: CountersArgs) -> anyhow::Result<()> {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
         println!();
     } else {
-        print!("{}", report.to_text());
+        print!("{}", report.to_text(palette));
     }
     Ok(())
 }
 
-fn run_annotate(args: AnnotateArgs) -> anyhow::Result<()> {
+fn run_annotate(args: AnnotateArgs, palette: Palette) -> anyhow::Result<()> {
     let bundle = TraceBundle::open(&args.trace).context("opening trace bundle")?;
     let binary = match args.binary.clone() {
         Some(b) => b,
@@ -392,6 +418,7 @@ fn run_annotate(args: AnnotateArgs) -> anyhow::Result<()> {
             show_zero: args.show_zero,
             source_root: args.source_root,
             mode: args.mode.into(),
+            colored: palette.colored,
         };
         let text = func.render(&render_opts)?;
         print!("{}", text);
@@ -503,19 +530,19 @@ fn init_tracing(verbose: bool) {
         .try_init();
 }
 
-fn run_toc(args: TocArgs) -> anyhow::Result<()> {
+fn run_toc(args: TocArgs, palette: Palette) -> anyhow::Result<()> {
     let bundle = TraceBundle::open(&args.trace).context("opening trace bundle")?;
     let toc = bundle.toc().context("loading TOC")?;
     if args.json {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &toc)?;
         println!();
     } else {
-        print!("{}", toc.to_text());
+        print!("{}", toc.to_text(palette));
     }
     Ok(())
 }
 
-fn run_hotspots(args: HotspotsArgs) -> anyhow::Result<()> {
+fn run_hotspots(args: HotspotsArgs, palette: Palette) -> anyhow::Result<()> {
     let bundle = TraceBundle::open(&args.trace).context("opening trace bundle")?;
     let mut builder = HotspotsBuilder::new(&bundle)
         .bucket_ns(args.bucket_ms.saturating_mul(1_000_000))
@@ -540,7 +567,7 @@ fn run_hotspots(args: HotspotsArgs) -> anyhow::Result<()> {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
         println!();
     } else {
-        print!("{}", report.to_text());
+        print!("{}", report.to_text(palette));
     }
     Ok(())
 }

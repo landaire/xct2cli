@@ -10,6 +10,7 @@ use annotate_snippets::Snippet;
 
 use crate::analysis::AnnotatedFunction;
 use crate::error::Result;
+use crate::render::Palette;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnotateMode {
@@ -25,6 +26,7 @@ pub struct AnnotateRenderOptions {
     pub show_zero: bool,
     pub source_root: Option<PathBuf>,
     pub mode: AnnotateMode,
+    pub colored: bool,
 }
 
 impl AnnotatedFunction {
@@ -40,7 +42,8 @@ impl AnnotatedFunction {
 
 fn render_instructions(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -> Result<String> {
     let mut out = String::new();
-    write_header(&mut out, func);
+    write_header(&mut out, func, opts);
+    let pal = Palette::new(opts.colored);
 
     let max_samples = func
         .instructions
@@ -52,38 +55,46 @@ fn render_instructions(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -
         if ins.samples == 0 && !opts.show_zero {
             continue;
         }
-        let bar = if max_samples > 0 {
-            let n = (ins.samples as f64 / max_samples as f64 * 10.0).round() as usize;
-            "#".repeat(n)
-        } else {
-            String::new()
-        };
+        let intensity = intensity(ins.samples, max_samples);
+        let bar = bar_str(ins.samples, max_samples);
         let loc = match (&ins.file, ins.line) {
             (Some(f), Some(l)) => format!("  // {}:{}", short_path(f), l),
             _ => String::new(),
         };
+        let heat = pal.heat(intensity);
         let _ = writeln!(
             out,
-            "  {:>5}  {:<10} 0x{:012x}  {} {}{}",
-            ins.samples, bar, ins.runtime_address, ins.mnemonic, ins.operands, loc
+            "  {}  {}  0x{:012x}  {} {}{}",
+            heat.style(format!("{:>5}", ins.samples)),
+            heat.style(format!("{:<10}", bar)),
+            ins.runtime_address.raw(),
+            ins.mnemonic,
+            ins.operands,
+            pal.path().style(loc),
         );
     }
 
-    let _ = writeln!(out, "\nsource hot-spots ({}):", func.weight_label);
+    let _ = writeln!(
+        out,
+        "\n{}",
+        pal.header()
+            .style(format!("source hot-spots ({}):", func.weight_label))
+    );
     write_source_blocks(&mut out, func, opts);
     Ok(out)
 }
 
 fn render_source_only(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -> Result<String> {
     let mut out = String::new();
-    write_header(&mut out, func);
+    write_header(&mut out, func, opts);
     write_source_blocks(&mut out, func, opts);
     Ok(out)
 }
 
 fn render_interleaved(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -> Result<String> {
     let mut out = String::new();
-    write_header(&mut out, func);
+    write_header(&mut out, func, opts);
+    let pal = Palette::new(opts.colored);
 
     let max_samples = func
         .instructions
@@ -105,34 +116,40 @@ fn render_interleaved(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) ->
                     .entry(f.clone())
                     .or_insert_with(|| read_source(f, opts.source_root.as_deref()));
                 let snippet_line = text.as_deref().and_then(|t| nth_line(t, l));
+                let loc = format!("{}:{}", short_path(f), l);
                 match snippet_line {
-                    Some(s) => format!("{}:{}  {}", short_path(f), l, s.trim()),
-                    None => format!("{}:{}", short_path(f), l),
+                    Some(s) => format!("{}  {}", pal.path().style(loc), s.trim()),
+                    None => format!("{}", pal.path().style(loc)),
                 }
             }
-            _ => "(no source mapping)".to_string(),
+            _ => format!("{}", pal.dim().style("(no source mapping)")),
         };
+        let group_intensity = intensity(total, max_samples);
         let _ = writeln!(
             out,
-            "{header}    [{} insns, {} {}]",
-            group.instructions.len(),
-            total,
-            func.weight_label
+            "{header}    {}",
+            pal.heat(group_intensity).style(format!(
+                "[{} insns, {} {}]",
+                group.instructions.len(),
+                total,
+                func.weight_label
+            )),
         );
         for ins in group.instructions {
             if ins.samples == 0 && !opts.show_zero {
                 continue;
             }
-            let bar = if max_samples > 0 {
-                let n = (ins.samples as f64 / max_samples as f64 * 10.0).round() as usize;
-                "#".repeat(n)
-            } else {
-                String::new()
-            };
+            let intensity = intensity(ins.samples, max_samples);
+            let bar = bar_str(ins.samples, max_samples);
+            let heat = pal.heat(intensity);
             let _ = writeln!(
                 out,
-                "      {:>5}  {:<10} 0x{:012x}  {} {}",
-                ins.samples, bar, ins.runtime_address, ins.mnemonic, ins.operands
+                "      {}  {}  0x{:012x}  {} {}",
+                heat.style(format!("{:>5}", ins.samples)),
+                heat.style(format!("{:<10}", bar)),
+                ins.runtime_address.raw(),
+                ins.mnemonic,
+                ins.operands
             );
         }
         let _ = writeln!(out);
@@ -140,26 +157,55 @@ fn render_interleaved(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) ->
     Ok(out)
 }
 
-fn write_header(out: &mut String, func: &AnnotatedFunction) {
+fn write_header(out: &mut String, func: &AnnotatedFunction, opts: &AnnotateRenderOptions) {
+    let pal = Palette::new(opts.colored);
     let _ = writeln!(
         out,
         "function: {} ({} {} in window, {} bytes)",
-        func.demangled_name,
+        pal.function().style(&func.demangled_name),
         func.total_samples,
         func.weight_label,
         func.runtime_end.raw() - func.runtime_start.raw()
     );
-    let _ = writeln!(out, "  binary:  {}", func.binary.display());
     let _ = writeln!(
         out,
-        "  runtime: 0x{:x}..0x{:x}   file: 0x{:x}..0x{:x}\n",
-        func.runtime_start, func.runtime_end, func.file_start, func.file_end
+        "  binary:  {}",
+        pal.path().style(func.binary.display())
     );
+    let _ = writeln!(
+        out,
+        "  runtime: {}   file: {}\n",
+        pal.dim().style(format!(
+            "0x{:x}..0x{:x}",
+            func.runtime_start, func.runtime_end
+        )),
+        pal.dim()
+            .style(format!("0x{:x}..0x{:x}", func.file_start, func.file_end)),
+    );
+}
+
+fn intensity(value: u64, max: u64) -> f64 {
+    if max == 0 {
+        return 0.0;
+    }
+    value as f64 / max as f64
+}
+
+fn bar_str(value: u64, max: u64) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let n = (value as f64 / max as f64 * 10.0).round() as usize;
+    "#".repeat(n)
 }
 
 fn write_source_blocks(out: &mut String, func: &AnnotatedFunction, opts: &AnnotateRenderOptions) {
     let blocks = group_by_source(func);
-    let renderer = Renderer::plain();
+    let renderer = if opts.colored {
+        Renderer::styled()
+    } else {
+        Renderer::plain()
+    };
     for (file, lines) in blocks {
         let Some(text) = read_source(&file, opts.source_root.as_deref()) else {
             let _ = writeln!(out, "  (source unavailable: {file})");

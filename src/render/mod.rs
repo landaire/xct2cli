@@ -3,7 +3,10 @@
 //! `text.rs` here.
 
 pub mod annotate;
+pub mod color;
 pub mod text;
 
 pub use annotate::AnnotateMode;
 pub use annotate::AnnotateRenderOptions;
+pub use color::ColorMode;
+pub use color::Palette;
