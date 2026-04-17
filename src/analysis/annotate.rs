@@ -12,39 +12,57 @@ use object::ObjectSymbol;
 use object::SymbolKind;
 use serde::Serialize;
 
-use crate::analysis::collect_pc_samples;
-use crate::analysis::metric_labels;
-use crate::analysis::per_pc_metric_deltas;
-use crate::analysis::per_pc_pmi_count;
+use crate::address::FilePc;
+use crate::address::Pid;
+use crate::address::RuntimePc;
+use crate::analysis::SlideMode;
 use crate::error::Error;
 use crate::error::Result;
+use crate::symbol::BinaryInfo;
 use crate::symbol::Symbolicator;
 use crate::symbol::SymbolicatorOptions;
-use crate::symbol::binary_info;
-use crate::symbol::read_image_loads;
-use crate::symbol::slide_from_kdebug;
 use crate::trace::TraceBundle;
+
+/// What the per-instruction `samples` field on each `AnnotatedInstruction`
+/// should represent. Mutually exclusive by construction (vs the prior
+/// `Option<usize>` + `Option<String>` combo where `Some + Some` was
+/// representable but invalid).
+#[derive(Debug, Clone, Default)]
+pub enum Weight {
+    /// Raw sample counts from `time-sample` (the default; works on any
+    /// trace with a Time Profiler instrument).
+    #[default]
+    Samples,
+    /// Per-PC delta sum of the counter at this index in the trace's
+    /// `MetricTable` / `kdebug-counters-with-time-sample`. Requires a
+    /// CPU Counters trace.
+    Metric { index: usize },
+    /// Per-PC PMI-overflow sample counts for the given event name
+    /// (e.g. `"l1d_load_miss"`, `"PL2_CACHE_MISS_LD"`). Requires a
+    /// CPU Counters trace recorded in a sampling mode.
+    PmiEvent { name: String },
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AnnotatedFunction {
     pub name: String,
     pub demangled_name: String,
-    pub runtime_start: u64,
-    pub runtime_end: u64,
-    pub file_start: u64,
-    pub file_end: u64,
+    pub runtime_start: RuntimePc,
+    pub runtime_end: RuntimePc,
+    pub file_start: FilePc,
+    pub file_end: FilePc,
     pub binary: PathBuf,
     pub total_samples: u64,
-    /// What the per-instruction `.samples` field actually represents,
-    /// e.g. `"samples"` or `"Instruction Processing Bottleneck"`.
+    /// What the per-instruction `samples` field actually represents
+    /// (e.g. `"samples"` or `"l1d_load_miss samples"`).
     pub weight_label: String,
     pub instructions: Vec<AnnotatedInstruction>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AnnotatedInstruction {
-    pub runtime_address: u64,
-    pub file_address: u64,
+    pub runtime_address: RuntimePc,
+    pub file_address: FilePc,
     pub bytes: Vec<u8>,
     pub mnemonic: String,
     pub operands: String,
@@ -54,33 +72,33 @@ pub struct AnnotatedInstruction {
     pub column: Option<u32>,
 }
 
+#[derive(Debug, Clone)]
 pub struct AnnotateOptions {
     pub function: String,
     pub binary: PathBuf,
     pub dsym: Option<PathBuf>,
-    /// `None` means auto-detect from kdebug DBG_DYLD events.
-    pub slide: Option<u64>,
-    pub pid: Option<i64>,
-    /// When `Some(idx)`, use the counter at that index from
-    /// `kdebug-counters-with-time-sample` (per-CPU deltas summed per PC)
-    /// instead of raw sample counts. Requires a CPU Counters trace.
-    pub metric: Option<usize>,
-    /// When `Some(name)`, count PMI-overflow samples (one per cache miss
-    /// or other PMU event) from `SamplingModeSamples` filtered by the
-    /// given `pmi-event` name (e.g. `"l1d_load_miss"`). Requires a
-    /// CPU Counters trace recorded in a sampling mode (e.g. L1D Miss).
-    pub event: Option<String>,
+    pub slide: SlideMode,
+    pub pid: Option<Pid>,
+    pub weight: Weight,
+}
+
+#[derive(Debug, Clone)]
+struct FoundSymbol {
+    file_addr: FilePc,
+    size: u64,
+    raw_name: String,
+    demangled: String,
 }
 
 pub fn annotate(bundle: &TraceBundle, opts: AnnotateOptions) -> Result<AnnotatedFunction> {
     let data = std::fs::read(&opts.binary)?;
     let macho = object::File::parse(&*data)?;
-    let slide = match opts.slide {
-        Some(s) => s,
-        None => {
-            let info = binary_info(&opts.binary)?;
-            let loads = read_image_loads(bundle).unwrap_or_default();
-            slide_from_kdebug(&info, &loads).ok_or_else(|| {
+    let slide = match &opts.slide {
+        SlideMode::Manual(s) => *s,
+        SlideMode::Auto => {
+            let info = BinaryInfo::open(&opts.binary)?;
+            let loads = bundle.image_loads().unwrap_or_default();
+            info.slide_from(&loads).ok_or_else(|| {
                 Error::Schema(
                     "could not auto-detect slide from kdebug DBG_DYLD events; pass --slide".into(),
                 )
@@ -88,30 +106,32 @@ pub fn annotate(bundle: &TraceBundle, opts: AnnotateOptions) -> Result<Annotated
         }
     };
 
-    let (sym_addr, sym_size, raw_name, demangled) = find_function(&macho, &opts.function)?;
+    let sym = find_function(&macho, &opts.function)?;
 
     let text = macho
         .section_by_name("__text")
         .ok_or_else(|| Error::Schema("binary has no __text section".into()))?;
-    let text_addr = text.address();
     let text_data = text.data().map_err(Error::MachO)?;
-    let _ = text_addr;
-    let offset_in_text = sym_addr
+    let offset_in_text = sym
+        .file_addr
+        .raw()
         .checked_sub(text.address())
-        .ok_or_else(|| Error::Schema(format!("symbol {raw_name:?} outside __text")))?
+        .ok_or_else(|| Error::Schema(format!("symbol {:?} outside __text", sym.raw_name)))?
         as usize;
     let end_in_text = offset_in_text
-        .checked_add(sym_size as usize)
+        .checked_add(sym.size as usize)
         .ok_or_else(|| Error::Schema("symbol size overflow".into()))?;
     if end_in_text > text_data.len() {
         return Err(Error::Schema(format!(
-            "symbol {raw_name:?} extends past __text"
+            "symbol {:?} extends past __text",
+            sym.raw_name
         )));
     }
     let func_bytes = &text_data[offset_in_text..end_in_text];
 
-    let runtime_start = sym_addr.wrapping_add(slide);
-    let runtime_end = runtime_start + sym_size;
+    let runtime_start = sym.file_addr.to_runtime(slide);
+    let runtime_end_file = FilePc::new(sym.file_addr.raw() + sym.size);
+    let runtime_end = runtime_end_file.to_runtime(slide);
 
     let symbolicator = Symbolicator::new(SymbolicatorOptions {
         binary: Some(opts.binary.clone()),
@@ -119,39 +139,8 @@ pub fn annotate(bundle: &TraceBundle, opts: AnnotateOptions) -> Result<Annotated
         slide,
     })?;
 
-    let (samples_by_pc, weight_label) = if let Some(event) = &opts.event {
-        let counts = per_pc_pmi_count(bundle, opts.pid, event)?;
-        let mut filtered: HashMap<u64, u64> = HashMap::new();
-        for (pc, v) in counts {
-            if pc >= runtime_start && pc < runtime_end {
-                filtered.insert(pc, v);
-            }
-        }
-        (filtered, format!("{event} samples"))
-    } else if let Some(idx) = opts.metric {
-        let labels = metric_labels(bundle).unwrap_or_default();
-        let deltas = per_pc_metric_deltas(bundle, opts.pid, idx)?;
-        let mut filtered: HashMap<u64, u64> = HashMap::new();
-        for (pc, v) in deltas {
-            if pc >= runtime_start && pc < runtime_end {
-                filtered.insert(pc, v);
-            }
-        }
-        let label = labels
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| format!("metric[{idx}]"));
-        (filtered, label)
-    } else {
-        let pc_samples = collect_pc_samples(bundle, opts.pid)?;
-        let mut filtered: HashMap<u64, u64> = HashMap::new();
-        for s in &pc_samples {
-            if s.pc >= runtime_start && s.pc < runtime_end {
-                filtered.insert(s.pc, s.samples);
-            }
-        }
-        (filtered, "samples".to_string())
-    };
+    let (samples_by_pc, weight_label) =
+        collect_weight(bundle, &opts.weight, opts.pid, runtime_start, runtime_end)?;
 
     let cs = Capstone::new()
         .arm64()
@@ -159,14 +148,14 @@ pub fn annotate(bundle: &TraceBundle, opts: AnnotateOptions) -> Result<Annotated
         .build()
         .map_err(|e| Error::Addr2Line(format!("capstone init: {e}")))?;
     let insns = cs
-        .disasm_all(func_bytes, sym_addr)
+        .disasm_all(func_bytes, sym.file_addr.raw())
         .map_err(|e| Error::Addr2Line(format!("disassemble: {e}")))?;
 
     let mut instructions: Vec<AnnotatedInstruction> = Vec::with_capacity(insns.len());
     let mut total_samples: u64 = 0;
     for ins in insns.iter() {
-        let file_addr = ins.address();
-        let runtime_addr = file_addr.wrapping_add(slide);
+        let file_addr = FilePc::new(ins.address());
+        let runtime_addr = file_addr.to_runtime(slide);
         let frame = symbolicator.resolve(runtime_addr).ok();
         let samples = samples_by_pc.get(&runtime_addr).copied().unwrap_or(0);
         total_samples += samples;
@@ -184,12 +173,12 @@ pub fn annotate(bundle: &TraceBundle, opts: AnnotateOptions) -> Result<Annotated
     }
 
     Ok(AnnotatedFunction {
-        name: raw_name,
-        demangled_name: demangled,
+        name: sym.raw_name,
+        demangled_name: sym.demangled,
         runtime_start,
         runtime_end,
-        file_start: sym_addr,
-        file_end: sym_addr + sym_size,
+        file_start: sym.file_addr,
+        file_end: FilePc::new(sym.file_addr.raw() + sym.size),
         binary: opts.binary,
         total_samples,
         weight_label,
@@ -197,11 +186,54 @@ pub fn annotate(bundle: &TraceBundle, opts: AnnotateOptions) -> Result<Annotated
     })
 }
 
-fn find_function<'a>(
-    macho: &'a object::File<'a>,
-    needle: &str,
-) -> Result<(u64, u64, String, String)> {
-    let mut text_syms: Vec<(u64, &str)> = macho
+fn collect_weight(
+    bundle: &TraceBundle,
+    weight: &Weight,
+    pid: Option<Pid>,
+    runtime_start: RuntimePc,
+    runtime_end: RuntimePc,
+) -> Result<(HashMap<RuntimePc, u64>, String)> {
+    match weight {
+        Weight::PmiEvent { name } => {
+            let counts = bundle.per_pc_pmi_count(pid, name)?;
+            let mut filtered: HashMap<RuntimePc, u64> = HashMap::new();
+            for (pc, v) in counts {
+                if pc >= runtime_start && pc < runtime_end {
+                    filtered.insert(pc, v);
+                }
+            }
+            Ok((filtered, format!("{name} samples")))
+        }
+        Weight::Metric { index } => {
+            let labels = bundle.metric_labels().unwrap_or_default();
+            let deltas = bundle.per_pc_metric_deltas(pid, *index)?;
+            let mut filtered: HashMap<RuntimePc, u64> = HashMap::new();
+            for (pc, v) in deltas {
+                if pc >= runtime_start && pc < runtime_end {
+                    filtered.insert(pc, v);
+                }
+            }
+            let label = labels
+                .get(*index)
+                .cloned()
+                .unwrap_or_else(|| format!("metric[{index}]"));
+            Ok((filtered, label))
+        }
+        Weight::Samples => {
+            let pc_samples = bundle.pc_samples(pid)?;
+            let mut filtered: HashMap<RuntimePc, u64> = HashMap::new();
+            for s in &pc_samples {
+                if s.pc >= runtime_start && s.pc < runtime_end {
+                    filtered.insert(s.pc, s.samples);
+                }
+            }
+            Ok((filtered, "samples".to_string()))
+        }
+    }
+}
+
+fn find_function<'a>(macho: &'a object::File<'a>, needle: &str) -> Result<FoundSymbol> {
+    let mut text_syms: Vec<(u64, &'a str)> = macho
         .symbols()
         .filter(|s| s.kind() == SymbolKind::Text)
         .filter_map(|s| s.name().ok().map(|n| (s.address(), n)))
@@ -221,7 +253,7 @@ fn find_function<'a>(
         .unwrap_or(u64::MAX);
 
     let needle_lower = needle.to_lowercase();
-    let mut best: Option<(usize, &str, String)> = None;
+    let mut best: Option<(usize, &'a str, String)> = None;
     for (idx, (_, raw)) in text_syms.iter().enumerate() {
         let dem = demangle_name(raw);
         let matches_full = dem == needle || raw == &needle;
@@ -242,7 +274,12 @@ fn find_function<'a>(
     let (addr, _) = text_syms[idx];
     let next_addr = text_syms.get(idx + 1).map(|(a, _)| *a).unwrap_or(text_end);
     let size = next_addr.saturating_sub(addr);
-    Ok((addr, size, raw.to_string(), dem))
+    Ok(FoundSymbol {
+        file_addr: FilePc::new(addr),
+        size,
+        raw_name: raw.to_string(),
+        demangled: dem,
+    })
 }
 
 fn demangle_name(s: &str) -> String {

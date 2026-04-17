@@ -29,6 +29,10 @@ pub enum RowReaderEvent {
     NodeEnd,
 }
 
+/// Result of `read_node_prelude`: optional schema, plus the first row if
+/// we had to consume one to know the prelude was over.
+type NodePrelude = (Option<Schema>, Option<Vec<Rc<Cell>>>);
+
 pub struct RowReader<R: BufRead> {
     reader: Reader<R>,
     buf: Vec<u8>,
@@ -119,7 +123,7 @@ impl<R: BufRead> RowReader<R> {
         }
     }
 
-    fn read_node_prelude(&mut self) -> Result<(Option<Schema>, Option<Vec<Rc<Cell>>>)> {
+    fn read_node_prelude(&mut self) -> Result<NodePrelude> {
         let mut schema: Option<Schema> = None;
         loop {
             self.buf.clear();

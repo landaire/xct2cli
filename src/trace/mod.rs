@@ -113,7 +113,3 @@ impl QueryResult {
         Ok(result)
     }
 }
-
-/// Convenience alias used by callers that don't care about the bundle
-/// surface vs in-memory data.
-pub type Trace = TraceBundle;

@@ -1,13 +1,18 @@
-//! PMI-overflow sample reading from `SamplingModeSamples`.
+//! PMI-overflow sampling.
 //!
-//! L1D miss / TLB miss / etc. traces emit one row per Nth event in the
-//! `SamplingModeSamples` table. Each row carries the precise PC, the
-//! event name (`pmi-event`, e.g. `l1d_load_miss`), and an inline
-//! backtrace.
+//! Two surfaces:
+//! - `SamplingModeSamples` (Guided-mode templates like L1D Miss Sampling) —
+//!   each row carries event name, PC, and inline backtrace.
+//! - `counters-profile` (Manual-mode templates) — rows have no per-sample
+//!   callstack, so PCs are recovered by joining each PMI timestamp to the
+//!   nearest `time-sample` row from a co-recorded Time Profiler.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 
+use crate::address::Pid;
+use crate::address::RuntimePc;
+use crate::address::SampleTime;
 use crate::error::Result;
 use crate::trace::TraceBundle;
 use crate::xml::Cell;
@@ -16,232 +21,233 @@ use crate::xml::stream::RowReaderEvent;
 
 #[derive(Debug, Clone)]
 pub struct PmiSample {
-    pub time: u64,
-    pub pid: i64,
+    pub time: SampleTime,
+    pub pid: Pid,
     pub event: String,
-    pub pc: u64,
+    pub pc: RuntimePc,
 }
 
-const SMS_XPATH: &str = "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"SamplingModeSamples\"]";
+#[derive(Debug, Clone, Copy)]
+struct TimePc {
+    time: SampleTime,
+    pc: RuntimePc,
+}
 
-pub fn read_pmi_samples(bundle: &TraceBundle, pid: Option<i64>) -> Result<Vec<PmiSample>> {
-    let xml = bundle.xctrace().export_xpath(bundle.path(), SMS_XPATH)?;
-    let mut reader = RowReader::new(std::io::Cursor::new(xml));
-    let mut out: Vec<PmiSample> = Vec::new();
-    while let Some(ev) = reader.next_event()? {
-        let RowReaderEvent::Row(cells) = ev else {
-            continue;
-        };
-        let mut time: Option<u64> = None;
-        let mut sample_pid: i64 = -1;
-        let mut event: Option<String> = None;
-        let mut pc: Option<u64> = None;
-        for cell in &cells {
-            match cell.element() {
-                Some("sample-time") => time = cell.as_u64(),
-                Some("string") => {
-                    if event.is_none()
-                        && let Cell::Leaf(l) = cell.as_ref()
-                    {
-                        event = Some(l.text.clone());
+impl TraceBundle {
+    /// Read every row of `SamplingModeSamples` (Guided-mode PMI sampling).
+    /// Returns `Ok(vec![])` if the table is absent or empty.
+    pub fn pmi_samples(&self, pid: Option<Pid>) -> Result<Vec<PmiSample>> {
+        let xml = self.xctrace().export_xpath(self.path(), SMS_XPATH)?;
+        let mut reader = RowReader::new(std::io::Cursor::new(xml));
+        let mut out: Vec<PmiSample> = Vec::new();
+        while let Some(ev) = reader.next_event()? {
+            let RowReaderEvent::Row(cells) = ev else {
+                continue;
+            };
+            let mut time: Option<SampleTime> = None;
+            let mut sample_pid: i64 = -1;
+            let mut event: Option<String> = None;
+            let mut pc: Option<RuntimePc> = None;
+            for cell in &cells {
+                match cell.element() {
+                    Some("sample-time") => time = cell.as_u64().map(SampleTime::new),
+                    Some("string") => {
+                        if event.is_none()
+                            && let Cell::Leaf(l) = cell.as_ref()
+                        {
+                            event = Some(l.text.clone());
+                        }
                     }
-                }
-                Some("thread") => {
-                    if let Some(p) = cell.find("pid") {
-                        sample_pid = p.as_i64().unwrap_or(-1);
+                    Some("thread") => {
+                        if let Some(p) = cell.find("pid") {
+                            sample_pid = p.as_i64().unwrap_or(-1);
+                        }
                     }
-                }
-                Some("uint64") => {
-                    // SamplingModeSamples has a `pc` column (uint64) and a
-                    // `weight-columns` array. PC is the first uint64 we see
-                    // (the array elements are `<uint64-array>`-typed).
-                    if pc.is_none() {
-                        pc = cell.as_u64();
+                    Some("uint64") => {
+                        // SamplingModeSamples has a `pc` column (uint64) and a
+                        // `weight-columns` array. PC is the first uint64 we see.
+                        if pc.is_none() {
+                            pc = cell.as_u64().map(RuntimePc::new);
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+            }
+            if let Some(want) = pid
+                && Pid::new(sample_pid) != want
+            {
+                continue;
+            }
+            let (Some(t), Some(e), Some(p)) = (time, event, pc) else {
+                continue;
+            };
+            out.push(PmiSample {
+                time: t,
+                pid: Pid::new(sample_pid),
+                event: e,
+                pc: p,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Distinct `pmi-event` names present in `SamplingModeSamples`.
+    pub fn pmi_event_names(&self) -> Result<Vec<String>> {
+        let samples = self.pmi_samples(None)?;
+        let mut set: BTreeSet<String> = BTreeSet::new();
+        for s in samples {
+            set.insert(s.event);
+        }
+        Ok(set.into_iter().collect())
+    }
+
+    /// Per-PC sample counts for the named PMI event. Tries
+    /// `SamplingModeSamples` first; falls back to `counters-profile` joined
+    /// against `time-sample` by nearest timestamp.
+    pub fn per_pc_pmi_count(
+        &self,
+        pid: Option<Pid>,
+        event: &str,
+    ) -> Result<HashMap<RuntimePc, u64>> {
+        let samples = self.pmi_samples(pid)?;
+        let mut out: HashMap<RuntimePc, u64> = HashMap::new();
+        for s in samples {
+            if s.event == event {
+                *out.entry(s.pc).or_insert(0) += 1;
             }
         }
-        if let Some(want) = pid
-            && sample_pid != want
-        {
-            continue;
+        if !out.is_empty() {
+            return Ok(out);
         }
-        let (Some(t), Some(e), Some(p)) = (time, event, pc) else {
-            continue;
+        let Some(toc_event) = self.counters_profile_event()? else {
+            return Ok(out);
         };
-        out.push(PmiSample {
-            time: t,
-            pid: sample_pid,
-            event: e,
-            pc: p,
-        });
-    }
-    Ok(out)
-}
-
-/// Distinct `pmi-event` names present in the trace (e.g. `l1d_load_miss`).
-pub fn pmi_event_names(bundle: &TraceBundle) -> Result<Vec<String>> {
-    let samples = read_pmi_samples(bundle, None)?;
-    let mut set: BTreeSet<String> = BTreeSet::new();
-    for s in samples {
-        set.insert(s.event);
-    }
-    Ok(set.into_iter().collect())
-}
-
-/// Per-PC sample counts for the named PMI event. Tries
-/// `SamplingModeSamples` first (Guided-mode templates carry their own
-/// PCs); falls back to `counters-profile` (Manual-mode templates have
-/// no per-sample callstacks, so PCs are recovered by joining each PMI
-/// timestamp to the nearest `time-sample` row).
-pub fn per_pc_pmi_count(
-    bundle: &TraceBundle,
-    pid: Option<i64>,
-    event: &str,
-) -> Result<HashMap<u64, u64>> {
-    let samples = read_pmi_samples(bundle, pid)?;
-    let mut out: HashMap<u64, u64> = HashMap::new();
-    for s in samples {
-        if s.event == event {
-            *out.entry(s.pc).or_insert(0) += 1;
+        if !toc_event.eq_ignore_ascii_case(event) {
+            return Ok(out);
         }
+        let pmi_times = self.read_counters_profile_times(pid)?;
+        if pmi_times.is_empty() {
+            return Ok(out);
+        }
+        let mut time_pcs = self.read_time_sample_times_pcs(pid)?;
+        time_pcs.sort_by_key(|tp| tp.time);
+        const MAX_WINDOW_NS: u64 = 1_000_000;
+        for t in pmi_times {
+            let Some(pc) = nearest_pc(&time_pcs, t, MAX_WINDOW_NS) else {
+                continue;
+            };
+            *out.entry(pc).or_insert(0) += 1;
+        }
+        Ok(out)
     }
-    if !out.is_empty() {
-        return Ok(out);
-    }
-    // Fallback: counters-profile (Manual mode). Match the event name
-    // recorded in the TOC, then join each row to the nearest time-sample
-    // by timestamp.
-    let toc_event = counters_profile_event(bundle)?;
-    let Some(toc_event) = toc_event else {
-        return Ok(out);
-    };
-    if !toc_event.eq_ignore_ascii_case(event) {
-        return Ok(out);
-    }
-    let pmi_times = read_counters_profile_times(bundle, pid)?;
-    if pmi_times.is_empty() {
-        return Ok(out);
-    }
-    let mut time_pcs = read_time_sample_times_pcs(bundle, pid)?;
-    time_pcs.sort_by_key(|(t, _)| *t);
-    let times: Vec<u64> = time_pcs.iter().map(|(t, _)| *t).collect();
-    const MAX_WINDOW_NS: u64 = 1_000_000;
-    for t in pmi_times {
-        let Some(pc) = nearest_pc(&times, &time_pcs, t, MAX_WINDOW_NS) else {
-            continue;
-        };
-        *out.entry(pc).or_insert(0) += 1;
-    }
-    Ok(out)
-}
 
-/// Read the `pmi-event` attribute on the trace's `counters-profile`
-/// table. Returns `None` if the table is absent.
-pub fn counters_profile_event(bundle: &TraceBundle) -> Result<Option<String>> {
-    let toc = bundle.toc()?;
-    let Some(run) = toc.first_run() else {
-        return Ok(None);
-    };
-    let Some(t) = run.tables.iter().find(|t| t.schema == "counters-profile") else {
-        return Ok(None);
-    };
-    Ok(t.attributes
-        .get("pmi-event")
-        .map(|v| v.trim_matches('"').to_string()))
-}
-
-fn read_counters_profile_times(bundle: &TraceBundle, pid: Option<i64>) -> Result<Vec<u64>> {
-    let xml = bundle.xctrace().export_xpath(bundle.path(), CP_XPATH)?;
-    let mut reader = RowReader::new(std::io::Cursor::new(xml));
-    let mut out: Vec<u64> = Vec::new();
-    while let Some(ev) = reader.next_event()? {
-        let RowReaderEvent::Row(cells) = ev else {
-            continue;
+    /// Read the `pmi-event` attribute from the trace's `counters-profile`
+    /// table — i.e. the event the Manual-mode template was configured to
+    /// sample on. Returns `None` if no such table exists.
+    pub fn counters_profile_event(&self) -> Result<Option<String>> {
+        let toc = self.toc()?;
+        let Some(run) = toc.first_run() else {
+            return Ok(None);
         };
-        let mut time: Option<u64> = None;
-        let mut sample_pid: i64 = -1;
-        for cell in &cells {
-            match cell.element() {
-                Some("sample-time") => time = cell.as_u64(),
-                Some("thread") => {
-                    if let Some(p) = cell.find("pid") {
-                        sample_pid = p.as_i64().unwrap_or(-1);
+        let Some(t) = run.tables.iter().find(|t| t.schema == "counters-profile") else {
+            return Ok(None);
+        };
+        Ok(t.attributes
+            .get("pmi-event")
+            .map(|v| v.trim_matches('"').to_string()))
+    }
+
+    fn read_counters_profile_times(&self, pid: Option<Pid>) -> Result<Vec<SampleTime>> {
+        let xml = self.xctrace().export_xpath(self.path(), CP_XPATH)?;
+        let mut reader = RowReader::new(std::io::Cursor::new(xml));
+        let mut out: Vec<SampleTime> = Vec::new();
+        while let Some(ev) = reader.next_event()? {
+            let RowReaderEvent::Row(cells) = ev else {
+                continue;
+            };
+            let mut time: Option<SampleTime> = None;
+            let mut sample_pid: i64 = -1;
+            for cell in &cells {
+                match cell.element() {
+                    Some("sample-time") => time = cell.as_u64().map(SampleTime::new),
+                    Some("thread") => {
+                        if let Some(p) = cell.find("pid") {
+                            sample_pid = p.as_i64().unwrap_or(-1);
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+            }
+            if let Some(want) = pid
+                && Pid::new(sample_pid) != want
+            {
+                continue;
+            }
+            if let Some(t) = time {
+                out.push(t);
             }
         }
-        if let Some(want) = pid
-            && sample_pid != want
-        {
-            continue;
-        }
-        if let Some(t) = time {
-            out.push(t);
-        }
+        Ok(out)
     }
-    Ok(out)
-}
 
-fn read_time_sample_times_pcs(bundle: &TraceBundle, pid: Option<i64>) -> Result<Vec<(u64, u64)>> {
-    let xml = bundle.xctrace().export_xpath(bundle.path(), TS_XPATH)?;
-    let mut reader = RowReader::new(std::io::Cursor::new(xml));
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    while let Some(ev) = reader.next_event()? {
-        let RowReaderEvent::Row(cells) = ev else {
-            continue;
-        };
-        let mut time: Option<u64> = None;
-        let mut sample_pid: i64 = -1;
-        let mut state: Option<&str> = None;
-        let mut pc: Option<u64> = None;
-        for cell in &cells {
-            match cell.element() {
-                Some("sample-time") => time = cell.as_u64(),
-                Some("thread") => {
-                    if let Some(p) = cell.find("pid") {
-                        sample_pid = p.as_i64().unwrap_or(-1);
+    fn read_time_sample_times_pcs(&self, pid: Option<Pid>) -> Result<Vec<TimePc>> {
+        let xml = self.xctrace().export_xpath(self.path(), TS_XPATH)?;
+        let mut reader = RowReader::new(std::io::Cursor::new(xml));
+        let mut out: Vec<TimePc> = Vec::new();
+        while let Some(ev) = reader.next_event()? {
+            let RowReaderEvent::Row(cells) = ev else {
+                continue;
+            };
+            let mut time: Option<SampleTime> = None;
+            let mut sample_pid: i64 = -1;
+            let mut state: Option<&str> = None;
+            let mut pc: Option<RuntimePc> = None;
+            for cell in &cells {
+                match cell.element() {
+                    Some("sample-time") => time = cell.as_u64().map(SampleTime::new),
+                    Some("thread") => {
+                        if let Some(p) = cell.find("pid") {
+                            sample_pid = p.as_i64().unwrap_or(-1);
+                        }
                     }
-                }
-                Some("thread-state") => {
-                    state = match cell.as_ref() {
-                        Cell::Leaf(l) => Some(l.text.as_str()),
-                        _ => None,
-                    };
-                }
-                Some("kperf-bt") => {
-                    if let Some(pcc) = cell.find("text-address") {
-                        pc = pcc.as_u64();
+                    Some("thread-state") => {
+                        state = match cell.as_ref() {
+                            Cell::Leaf(l) => Some(l.text.as_str()),
+                            _ => None,
+                        };
                     }
+                    Some("kperf-bt") => {
+                        if let Some(pcc) = cell.find("text-address") {
+                            pc = pcc.as_u64().map(RuntimePc::new);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            if state == Some("Blocked") {
+                continue;
+            }
+            if let Some(want) = pid
+                && Pid::new(sample_pid) != want
+            {
+                continue;
+            }
+            let (Some(t), Some(p)) = (time, pc) else {
+                continue;
+            };
+            out.push(TimePc { time: t, pc: p });
         }
-        if state == Some("Blocked") {
-            continue;
-        }
-        if let Some(want) = pid
-            && sample_pid != want
-        {
-            continue;
-        }
-        let (Some(t), Some(p)) = (time, pc) else {
-            continue;
-        };
-        out.push((t, p));
+        Ok(out)
     }
-    Ok(out)
 }
 
-fn nearest_pc(times: &[u64], time_pcs: &[(u64, u64)], target: u64, max_window: u64) -> Option<u64> {
-    let i = times.partition_point(|t| *t <= target);
-    let prev = if i > 0 { Some(time_pcs[i - 1]) } else { None };
+fn nearest_pc(time_pcs: &[TimePc], target: SampleTime, max_window: u64) -> Option<RuntimePc> {
+    let i = time_pcs.partition_point(|tp| tp.time <= target);
+    let prev = i.checked_sub(1).map(|j| time_pcs[j]);
     let next = time_pcs.get(i).copied();
     let best = match (prev, next) {
         (Some(p), Some(n)) => {
-            if target - p.0 <= n.0 - target {
+            if target.ns() - p.time.ns() <= n.time.ns() - target.ns() {
                 p
             } else {
                 n
@@ -251,12 +257,17 @@ fn nearest_pc(times: &[u64], time_pcs: &[(u64, u64)], target: u64, max_window: u
         (None, Some(n)) => n,
         (None, None) => return None,
     };
-    let dist = best.0.abs_diff(target);
+    let dist = if best.time.ns() > target.ns() {
+        best.time.ns() - target.ns()
+    } else {
+        target.ns() - best.time.ns()
+    };
     if dist > max_window {
         return None;
     }
-    Some(best.1)
+    Some(best.pc)
 }
 
+const SMS_XPATH: &str = "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"SamplingModeSamples\"]";
 const CP_XPATH: &str = "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"counters-profile\"]";
 const TS_XPATH: &str = "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"time-sample\"]";

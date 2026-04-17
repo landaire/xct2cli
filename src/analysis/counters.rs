@@ -3,17 +3,20 @@
 //! (sample-time -> counter values) on `sample-time`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use serde::Serialize;
 
-use std::path::PathBuf;
-
+use crate::address::CoreId;
+use crate::address::Pid;
+use crate::address::RuntimePc;
+use crate::address::SampleTime;
+use crate::address::Slide;
+use crate::analysis::SlideMode;
 use crate::error::Result;
+use crate::symbol::BinaryInfo;
 use crate::symbol::Symbolicator;
 use crate::symbol::SymbolicatorOptions;
-use crate::symbol::binary_info;
-use crate::symbol::read_image_loads;
-use crate::symbol::slide_from_kdebug;
 use crate::trace::TraceBundle;
 use crate::xml::Cell;
 use crate::xml::stream::RowReader;
@@ -28,7 +31,7 @@ pub struct CounterReport {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PerPcCounter {
-    pub pc: u64,
+    pub pc: RuntimePc,
     pub samples: u64,
     pub values: Vec<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,69 +42,81 @@ pub struct PerPcCounter {
     pub line: Option<u32>,
 }
 
-/// Read counter labels (e.g. `["Cycles", "Instruction Delivery Bottleneck", ...]`)
-/// from the trace's `MetricTable` swift-table debug dump.
-pub fn metric_labels(bundle: &TraceBundle) -> Result<Vec<String>> {
-    read_labels(bundle)
-}
-
-/// Compute the per-PC sum of `metric_idx`'s sample-to-sample deltas
-/// (per-CPU). This is the same join that `CountersBuilder::run` does,
-/// but returns a flat `pc -> delta-sum` map for one metric so other
-/// commands (notably `annotate`) can overlay it.
-pub fn per_pc_metric_deltas(
-    bundle: &TraceBundle,
-    pid: Option<i64>,
-    metric_idx: usize,
-) -> Result<HashMap<u64, u64>> {
-    let time_samples = read_time_samples(bundle, pid)?;
-    let counter_rows = read_counters_with_core(bundle, pid)?;
-
-    let mut by_time: HashMap<u64, &TimeSample> = HashMap::with_capacity(time_samples.len());
-    for ts in &time_samples {
-        by_time.insert(ts.time, ts);
-    }
-    let mut by_core: HashMap<u32, Vec<&CounterSample>> = HashMap::new();
-    for cs in &counter_rows {
-        by_core.entry(cs.core).or_default().push(cs);
+impl TraceBundle {
+    /// Counter labels from `MetricTable`'s `swift-table` attribute.
+    /// The attribute is a Swift `Mirror` debug dump containing a
+    /// `metricLegend` substring of the form
+    /// `"index 0: Cycles \n\nindex 1: ...\n\n"`; labels are extracted
+    /// positionally.
+    pub fn metric_labels(&self) -> Result<Vec<String>> {
+        let toc = self.toc()?;
+        let Some(run) = toc.first_run() else {
+            return Ok(Vec::new());
+        };
+        let Some(table) = run.table("MetricTable") else {
+            return Ok(Vec::new());
+        };
+        let Some(swift) = table.attributes.get("swift-table") else {
+            return Ok(Vec::new());
+        };
+        Ok(parse_metric_legend(swift))
     }
 
-    let mut out: HashMap<u64, u64> = HashMap::new();
-    for (_core, samples) in by_core {
-        for win in samples.windows(2) {
-            let prev = win[0];
-            let curr = win[1];
-            if curr.counters.len() != prev.counters.len() {
-                continue;
-            }
-            let Some(ts) = by_time.get(&curr.time).copied() else {
-                continue;
-            };
-            let Some(c) = curr.counters.get(metric_idx) else {
-                continue;
-            };
-            let Some(p) = prev.counters.get(metric_idx) else {
-                continue;
-            };
-            let delta = c.saturating_sub(*p);
-            // Drop suspicious deltas (thread migration, counter reset).
-            if delta > 1_000_000_000 {
-                continue;
-            }
-            *out.entry(ts.pc).or_insert(0) += delta;
+    /// Per-PC sum of `metric_idx`'s sample-to-sample deltas (per-CPU).
+    pub fn per_pc_metric_deltas(
+        &self,
+        pid: Option<Pid>,
+        metric_idx: usize,
+    ) -> Result<HashMap<RuntimePc, u64>> {
+        let time_samples = read_time_samples(self, pid)?;
+        let counter_rows = read_counters_with_core(self, pid)?;
+
+        let mut by_time: HashMap<SampleTime, &TimeSample> =
+            HashMap::with_capacity(time_samples.len());
+        for ts in &time_samples {
+            by_time.insert(ts.time, ts);
         }
+        let mut by_core: HashMap<CoreId, Vec<&CounterSample>> = HashMap::new();
+        for cs in &counter_rows {
+            by_core.entry(cs.core).or_default().push(cs);
+        }
+
+        let mut out: HashMap<RuntimePc, u64> = HashMap::new();
+        for (_core, samples) in by_core {
+            for win in samples.windows(2) {
+                let prev = win[0];
+                let curr = win[1];
+                if curr.counters.len() != prev.counters.len() {
+                    continue;
+                }
+                let Some(ts) = by_time.get(&curr.time).copied() else {
+                    continue;
+                };
+                let Some(c) = curr.counters.get(metric_idx) else {
+                    continue;
+                };
+                let Some(p) = prev.counters.get(metric_idx) else {
+                    continue;
+                };
+                let delta = c.saturating_sub(*p);
+                if delta > 1_000_000_000 {
+                    continue;
+                }
+                *out.entry(ts.pc).or_insert(0) += delta;
+            }
+        }
+        Ok(out)
     }
-    Ok(out)
 }
 
 pub struct CountersBuilder<'a> {
     bundle: &'a TraceBundle,
-    pid: Option<i64>,
+    pid: Option<Pid>,
     top_n: usize,
     sort_by_index: Option<usize>,
     binary: Option<PathBuf>,
     dsym: Option<PathBuf>,
-    slide: Option<u64>,
+    slide: SlideMode,
 }
 
 impl<'a> CountersBuilder<'a> {
@@ -113,11 +128,11 @@ impl<'a> CountersBuilder<'a> {
             sort_by_index: None,
             binary: None,
             dsym: None,
-            slide: None,
+            slide: SlideMode::default(),
         }
     }
 
-    pub fn pid(mut self, pid: i64) -> Self {
+    pub fn pid(mut self, pid: Pid) -> Self {
         self.pid = Some(pid);
         self
     }
@@ -142,30 +157,29 @@ impl<'a> CountersBuilder<'a> {
         self
     }
 
-    pub fn slide(mut self, slide: Option<u64>) -> Self {
-        self.slide = slide;
+    pub fn slide(mut self, mode: SlideMode) -> Self {
+        self.slide = mode;
         self
     }
 
     pub fn run(self) -> Result<CounterReport> {
-        let labels = read_labels(self.bundle).unwrap_or_default();
+        let labels = self.bundle.metric_labels().unwrap_or_default();
 
         let time_samples = read_time_samples(self.bundle, self.pid)?;
         let counter_rows = read_counters_with_core(self.bundle, self.pid)?;
 
-        let mut by_time: HashMap<u64, &TimeSample> = HashMap::with_capacity(time_samples.len());
+        let mut by_time: HashMap<SampleTime, &TimeSample> =
+            HashMap::with_capacity(time_samples.len());
         for ts in &time_samples {
             by_time.insert(ts.time, ts);
         }
 
-        // Group counter rows by core, in trace order, so we can diff
-        // consecutive samples on the same physical CPU.
-        let mut by_core: HashMap<u32, Vec<&CounterSample>> = HashMap::new();
+        let mut by_core: HashMap<CoreId, Vec<&CounterSample>> = HashMap::new();
         for cs in &counter_rows {
             by_core.entry(cs.core).or_default().push(cs);
         }
 
-        let mut per_pc: HashMap<u64, PerPcCounter> = HashMap::new();
+        let mut per_pc: HashMap<RuntimePc, PerPcCounter> = HashMap::new();
         let mut total_attributed: u64 = 0;
 
         for (_core, samples) in by_core {
@@ -189,9 +203,6 @@ impl<'a> CountersBuilder<'a> {
                     .zip(prev.counters.iter())
                     .map(|(c, p)| c.saturating_sub(*p))
                     .collect();
-                // A monotonic counter can appear to "wrap" if the thread
-                // got migrated mid-window or kperf reset; bail on the
-                // sample if any non-tail counter implausibly large.
                 if deltas
                     .iter()
                     .take(deltas.len().saturating_sub(4))
@@ -232,13 +243,13 @@ impl<'a> CountersBuilder<'a> {
         rows.truncate(self.top_n);
 
         if self.binary.is_some() || self.dsym.is_some() {
-            let slide = match self.slide {
-                Some(s) => Some(s),
-                None => match self.binary.as_deref() {
+            let slide = match &self.slide {
+                SlideMode::Manual(s) => Some(*s),
+                SlideMode::Auto => match self.binary.as_deref() {
                     Some(bin) => {
-                        let info = binary_info(bin)?;
-                        let loads = read_image_loads(self.bundle).unwrap_or_default();
-                        slide_from_kdebug(&info, &loads)
+                        let info = BinaryInfo::open(bin)?;
+                        let loads = self.bundle.image_loads().unwrap_or_default();
+                        info.slide_from(&loads)
                     }
                     None => None,
                 },
@@ -246,7 +257,7 @@ impl<'a> CountersBuilder<'a> {
             let opts = SymbolicatorOptions {
                 binary: self.binary.clone(),
                 dsym: self.dsym.clone(),
-                slide: slide.unwrap_or(0),
+                slide: slide.unwrap_or(Slide::ZERO),
             };
             let sym = Symbolicator::new(opts)?;
             for r in &mut rows {
@@ -268,19 +279,19 @@ impl<'a> CountersBuilder<'a> {
 
 #[derive(Debug)]
 struct TimeSample {
-    time: u64,
-    pid: i64,
-    pc: u64,
+    time: SampleTime,
+    pid: Pid,
+    pc: RuntimePc,
 }
 
 #[derive(Debug)]
 struct CounterSample {
-    time: u64,
-    core: u32,
+    time: SampleTime,
+    core: CoreId,
     counters: Vec<u64>,
 }
 
-fn read_time_samples(bundle: &TraceBundle, pid_filter: Option<i64>) -> Result<Vec<TimeSample>> {
+fn read_time_samples(bundle: &TraceBundle, pid_filter: Option<Pid>) -> Result<Vec<TimeSample>> {
     let xml = bundle
         .xctrace()
         .export_xpath(bundle.path(), TIME_SAMPLE_XPATH)?;
@@ -290,13 +301,13 @@ fn read_time_samples(bundle: &TraceBundle, pid_filter: Option<i64>) -> Result<Ve
         let RowReaderEvent::Row(cells) = ev else {
             continue;
         };
-        let mut time: Option<u64> = None;
+        let mut time: Option<SampleTime> = None;
         let mut pid: i64 = -1;
         let mut state: Option<&str> = None;
-        let mut pc: Option<u64> = None;
+        let mut pc: Option<RuntimePc> = None;
         for cell in &cells {
             match cell.element() {
-                Some("sample-time") => time = cell.as_u64(),
+                Some("sample-time") => time = cell.as_u64().map(SampleTime::new),
                 Some("thread") => {
                     if let Some(p) = cell.find("pid") {
                         pid = p.as_i64().unwrap_or(-1);
@@ -310,7 +321,7 @@ fn read_time_samples(bundle: &TraceBundle, pid_filter: Option<i64>) -> Result<Ve
                 }
                 Some("kperf-bt") => {
                     if let Some(pcc) = cell.find("text-address") {
-                        pc = pcc.as_u64();
+                        pc = pcc.as_u64().map(RuntimePc::new);
                     }
                 }
                 _ => {}
@@ -320,7 +331,7 @@ fn read_time_samples(bundle: &TraceBundle, pid_filter: Option<i64>) -> Result<Ve
             continue;
         }
         if let Some(want) = pid_filter
-            && pid != want
+            && Pid::new(pid) != want
         {
             continue;
         }
@@ -329,7 +340,7 @@ fn read_time_samples(bundle: &TraceBundle, pid_filter: Option<i64>) -> Result<Ve
         };
         out.push(TimeSample {
             time: t,
-            pid,
+            pid: Pid::new(pid),
             pc: p,
         });
     }
@@ -338,7 +349,7 @@ fn read_time_samples(bundle: &TraceBundle, pid_filter: Option<i64>) -> Result<Ve
 
 fn read_counters_with_core(
     bundle: &TraceBundle,
-    pid_filter: Option<i64>,
+    pid_filter: Option<Pid>,
 ) -> Result<Vec<CounterSample>> {
     let xml = bundle.xctrace().export_xpath(bundle.path(), KDC_XPATH)?;
     let mut reader = RowReader::new(std::io::Cursor::new(xml));
@@ -347,20 +358,20 @@ fn read_counters_with_core(
         let RowReaderEvent::Row(cells) = ev else {
             continue;
         };
-        let mut time: Option<u64> = None;
+        let mut time: Option<SampleTime> = None;
         let mut pid: i64 = -1;
         let mut state: Option<&str> = None;
-        let mut core: Option<u32> = None;
+        let mut core: Option<CoreId> = None;
         let mut counters: Option<Vec<u64>> = None;
         for cell in &cells {
             match cell.element() {
-                Some("sample-time") => time = cell.as_u64(),
+                Some("sample-time") => time = cell.as_u64().map(SampleTime::new),
                 Some("thread") => {
                     if let Some(p) = cell.find("pid") {
                         pid = p.as_i64().unwrap_or(-1);
                     }
                 }
-                Some("core") => core = cell.as_u64().map(|v| v as u32),
+                Some("core") => core = cell.as_u64().map(|v| CoreId::new(v as u32)),
                 Some("thread-state") => {
                     state = match cell.as_ref() {
                         Cell::Leaf(l) => Some(l.text.as_str()),
@@ -375,7 +386,7 @@ fn read_counters_with_core(
             continue;
         }
         if let Some(want) = pid_filter
-            && pid != want
+            && Pid::new(pid) != want
         {
             continue;
         }
@@ -392,6 +403,8 @@ fn read_counters_with_core(
 }
 
 const TIME_SAMPLE_XPATH: &str = "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"time-sample\"]";
+const KDC_XPATH: &str =
+    "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"kdebug-counters-with-time-sample\"]";
 
 fn parse_pmc_text(cell: &Cell) -> Option<Vec<u64>> {
     let text = cell.text()?;
@@ -400,27 +413,6 @@ fn parse_pmc_text(cell: &Cell) -> Option<Vec<u64>> {
         out.push(tok.parse::<u64>().ok()?);
     }
     Some(out)
-}
-
-const KDC_XPATH: &str =
-    "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"kdebug-counters-with-time-sample\"]";
-
-/// Pull metric labels from `MetricTable`'s `swift-table` attribute. The
-/// attribute is a Swift `Mirror` debug dump that contains a `metricLegend`
-/// substring of the form `"index 0: Cycles \n\nindex 1: ...\n\n"`. We
-/// extract the labels positionally by index.
-fn read_labels(bundle: &TraceBundle) -> Result<Vec<String>> {
-    let toc = bundle.toc()?;
-    let Some(run) = toc.first_run() else {
-        return Ok(Vec::new());
-    };
-    let Some(table) = run.table("MetricTable") else {
-        return Ok(Vec::new());
-    };
-    let Some(swift) = table.attributes.get("swift-table") else {
-        return Ok(Vec::new());
-    };
-    Ok(parse_metric_legend(swift))
 }
 
 fn parse_metric_legend(swift_table: &str) -> Vec<String> {

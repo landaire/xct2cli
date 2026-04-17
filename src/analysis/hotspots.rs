@@ -2,18 +2,20 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use serde::Serialize;
 
-use std::path::PathBuf;
-
+use crate::address::CoreId;
+use crate::address::Pid;
+use crate::address::RuntimePc;
+use crate::address::SampleTime;
+use crate::address::Slide;
 use crate::error::Result;
+use crate::symbol::BinaryInfo;
 use crate::symbol::Symbolicator;
 use crate::symbol::SymbolicatorOptions;
-use crate::symbol::binary_info;
-use crate::symbol::read_image_loads;
-use crate::symbol::slide_from_kdebug;
 use crate::trace::TraceBundle;
 use crate::xml::Cell;
 use crate::xml::stream::RowReader;
@@ -22,7 +24,7 @@ use crate::xml::stream::RowReaderEvent;
 #[derive(Clone, Serialize)]
 pub struct HotspotReport {
     pub total_samples: u64,
-    pub per_cpu: BTreeMap<u32, CpuStats>,
+    pub per_cpu: BTreeMap<CoreId, CpuStats>,
     pub timeline_buckets_ns: u64,
     pub timeline: Vec<TimelineBucket>,
     pub top_pcs: Vec<Hotspot>,
@@ -38,12 +40,12 @@ pub struct CpuStats {
 pub struct TimelineBucket {
     pub start_ns: u64,
     pub end_ns: u64,
-    pub samples_per_cpu: BTreeMap<u32, u64>,
+    pub samples_per_cpu: BTreeMap<CoreId, u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Hotspot {
-    pub pc: u64,
+    pub pc: RuntimePc,
     pub samples: u64,
     pub fmt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,15 +56,25 @@ pub struct Hotspot {
     pub line: Option<u32>,
 }
 
+/// Where `HotspotsBuilder` should get its slide from.
+#[derive(Debug, Clone, Default)]
+pub enum SlideMode {
+    /// Recover from kdebug DBG_DYLD events when a binary is provided.
+    #[default]
+    Auto,
+    /// Use the explicit slide.
+    Manual(Slide),
+}
+
 pub struct HotspotsBuilder<'a> {
     bundle: &'a TraceBundle,
-    pid: Option<i64>,
+    pid: Option<Pid>,
     bucket_ns: u64,
     top_n: usize,
     time_window_ns: Option<(u64, u64)>,
     binary: Option<PathBuf>,
     dsym: Option<PathBuf>,
-    slide: Option<u64>,
+    slide: SlideMode,
 }
 
 impl<'a> HotspotsBuilder<'a> {
@@ -75,7 +87,7 @@ impl<'a> HotspotsBuilder<'a> {
             time_window_ns: None,
             binary: None,
             dsym: None,
-            slide: None,
+            slide: SlideMode::default(),
         }
     }
 
@@ -89,12 +101,12 @@ impl<'a> HotspotsBuilder<'a> {
         self
     }
 
-    pub fn slide(mut self, slide: Option<u64>) -> Self {
-        self.slide = slide;
+    pub fn slide(mut self, mode: SlideMode) -> Self {
+        self.slide = mode;
         self
     }
 
-    pub fn pid(mut self, pid: i64) -> Self {
+    pub fn pid(mut self, pid: Pid) -> Self {
         self.pid = Some(pid);
         self
     }
@@ -122,9 +134,9 @@ impl<'a> HotspotsBuilder<'a> {
         let mut reader = RowReader::new(std::io::Cursor::new(xml));
 
         let mut total_samples: u64 = 0;
-        let mut per_cpu: BTreeMap<u32, CpuStats> = BTreeMap::new();
-        let mut pc_counts: HashMap<u64, (u64, Option<String>)> = HashMap::new();
-        let mut bucket_map: BTreeMap<u64, BTreeMap<u32, u64>> = BTreeMap::new();
+        let mut per_cpu: BTreeMap<CoreId, CpuStats> = BTreeMap::new();
+        let mut pc_counts: HashMap<RuntimePc, PcAccumulator> = HashMap::new();
+        let mut bucket_map: BTreeMap<u64, BTreeMap<CoreId, u64>> = BTreeMap::new();
         let mut origin_ns: Option<u64> = None;
 
         while let Some(ev) = reader.next_event()? {
@@ -140,7 +152,7 @@ impl<'a> HotspotsBuilder<'a> {
                 continue;
             }
             if let Some((lo, hi)) = self.time_window_ns
-                && (sample.time_ns < lo || sample.time_ns >= hi)
+                && (sample.time.ns() < lo || sample.time.ns() >= hi)
             {
                 continue;
             }
@@ -153,8 +165,8 @@ impl<'a> HotspotsBuilder<'a> {
                 entry.label = sample.core_label;
             }
 
-            let origin = *origin_ns.get_or_insert(sample.time_ns);
-            let bucket_key = (sample.time_ns.saturating_sub(origin)) / self.bucket_ns;
+            let origin = *origin_ns.get_or_insert(sample.time.ns());
+            let bucket_key = (sample.time.ns().saturating_sub(origin)) / self.bucket_ns;
             *bucket_map
                 .entry(bucket_key)
                 .or_default()
@@ -162,8 +174,11 @@ impl<'a> HotspotsBuilder<'a> {
                 .or_default() += 1;
 
             if let Some(pc) = sample.pc {
-                let e = pc_counts.entry(pc).or_insert((0, sample.pc_fmt));
-                e.0 += 1;
+                let e = pc_counts.entry(pc).or_insert_with(|| PcAccumulator {
+                    samples: 0,
+                    fmt: sample.pc_fmt.clone(),
+                });
+                e.samples += 1;
             }
         }
 
@@ -182,10 +197,10 @@ impl<'a> HotspotsBuilder<'a> {
 
         let mut top_pcs: Vec<Hotspot> = pc_counts
             .into_iter()
-            .map(|(pc, (samples, fmt))| Hotspot {
+            .map(|(pc, acc)| Hotspot {
                 pc,
-                samples,
-                fmt,
+                samples: acc.samples,
+                fmt: acc.fmt,
                 function: None,
                 file: None,
                 line: None,
@@ -195,23 +210,23 @@ impl<'a> HotspotsBuilder<'a> {
         top_pcs.truncate(self.top_n);
 
         if self.binary.is_some() || self.dsym.is_some() {
-            let slide = match self.slide {
-                Some(s) => Some(s),
-                None => match self.binary.as_deref() {
+            let slide = match &self.slide {
+                SlideMode::Manual(s) => Some(*s),
+                SlideMode::Auto => match self.binary.as_deref() {
                     Some(bin) => {
-                        let info = binary_info(bin)?;
-                        let loads = match read_image_loads(self.bundle) {
+                        let info = BinaryInfo::open(bin)?;
+                        let loads = match self.bundle.image_loads() {
                             Ok(v) => v,
                             Err(e) => {
-                                tracing::warn!("read_image_loads failed: {e}");
+                                tracing::warn!("image_loads failed: {e}");
                                 Vec::new()
                             }
                         };
-                        let s = slide_from_kdebug(&info, &loads);
+                        let s = info.slide_from(&loads);
                         match s {
                             Some(s) => {
                                 tracing::info!(
-                                    slide = format!("0x{:x}", s),
+                                    %s,
                                     "auto-detected slide from kdebug DBG_DYLD events"
                                 );
                             }
@@ -229,7 +244,7 @@ impl<'a> HotspotsBuilder<'a> {
             let opts = SymbolicatorOptions {
                 binary: self.binary.clone(),
                 dsym: self.dsym.clone(),
-                slide: slide.unwrap_or(0),
+                slide: slide.unwrap_or(Slide::ZERO),
             };
             let sym = Symbolicator::new(opts)?;
             for h in &mut top_pcs {
@@ -253,15 +268,35 @@ impl<'a> HotspotsBuilder<'a> {
 
 const TIME_SAMPLE_XPATH: &str = "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"time-sample\"]";
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct PcAccumulator {
+    samples: u64,
+    fmt: Option<String>,
+}
+
+#[derive(Debug)]
 struct ParsedSample {
-    time_ns: u64,
-    pid: i64,
-    core: Option<u32>,
+    time: SampleTime,
+    pid: Pid,
+    core: Option<CoreId>,
     core_label: Option<String>,
-    pc: Option<u64>,
+    pc: Option<RuntimePc>,
     pc_fmt: Option<String>,
     thread_state: Option<String>,
+}
+
+impl Default for ParsedSample {
+    fn default() -> Self {
+        Self {
+            time: SampleTime::new(0),
+            pid: Pid::unknown(),
+            core: None,
+            core_label: None,
+            pc: None,
+            pc_fmt: None,
+            thread_state: None,
+        }
+    }
 }
 
 fn parse_time_sample(cells: &[Rc<Cell>]) -> Option<ParsedSample> {
@@ -269,15 +304,15 @@ fn parse_time_sample(cells: &[Rc<Cell>]) -> Option<ParsedSample> {
     for cell in cells {
         match cell.element() {
             Some("sample-time") => {
-                s.time_ns = cell.as_u64().unwrap_or(0);
+                s.time = SampleTime::new(cell.as_u64().unwrap_or(0));
             }
             Some("thread") => {
                 if let Some(pid_cell) = cell.find("pid") {
-                    s.pid = pid_cell.as_i64().unwrap_or(-1);
+                    s.pid = Pid::new(pid_cell.as_i64().unwrap_or(-1));
                 }
             }
             Some("core") => {
-                s.core = cell.as_u64().map(|v| v as u32);
+                s.core = cell.as_u64().map(|v| CoreId::new(v as u32));
                 s.core_label = cell.fmt().map(str::to_string);
             }
             Some("thread-state") => {
@@ -285,18 +320,17 @@ fn parse_time_sample(cells: &[Rc<Cell>]) -> Option<ParsedSample> {
             }
             Some("kperf-bt") => {
                 if let Some(pc_cell) = cell.find("text-address") {
-                    s.pc = pc_cell.as_u64();
+                    s.pc = pc_cell.as_u64().map(RuntimePc::new);
                     s.pc_fmt = pc_cell.fmt().map(str::to_string);
                 }
             }
             _ => {}
         }
     }
-    if s.time_ns == 0 && s.core.is_none() {
+    if s.time.ns() == 0 && s.core.is_none() {
         return None;
     }
     if matches!(s.thread_state.as_deref(), Some("Blocked")) {
-        // Blocked samples have no real CPU; skip from hot-spot accounting.
         return None;
     }
     Some(s)

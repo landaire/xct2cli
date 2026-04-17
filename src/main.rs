@@ -9,21 +9,17 @@ use clap::Subcommand;
 use tracing_subscriber::EnvFilter;
 use xct2cli::xctrace::Xctrace;
 
+use xct2cli::Pid;
+use xct2cli::Slide;
 use xct2cli::analysis::AnnotateOptions;
 use xct2cli::analysis::CountersBuilder;
 use xct2cli::analysis::HotspotsBuilder;
+use xct2cli::analysis::SlideMode;
+use xct2cli::analysis::Weight;
 use xct2cli::analysis::annotate;
-use xct2cli::analysis::collect_pc_samples;
-use xct2cli::analysis::counters_profile_event;
-use xct2cli::analysis::metric_labels;
-use xct2cli::analysis::read_pmi_samples;
-use xct2cli::render;
 use xct2cli::render::AnnotateMode;
 use xct2cli::render::AnnotateRenderOptions;
-use xct2cli::symbol::binary_info;
-use xct2cli::symbol::enumerate_slides;
-use xct2cli::symbol::read_image_loads;
-use xct2cli::symbol::slide_from_kdebug;
+use xct2cli::symbol::BinaryInfo;
 use xct2cli::trace::TraceBundle;
 
 #[derive(Parser, Debug)]
@@ -70,7 +66,6 @@ enum Command {
 #[derive(clap::Args, Debug)]
 struct EventsArgs {
     trace: PathBuf,
-
     #[arg(long)]
     json: bool,
 }
@@ -80,16 +75,13 @@ struct RecordArgs {
     /// Output `.trace` bundle path.
     #[arg(long, short = 'o')]
     output: Utf8PathBuf,
-
     /// Instruments template name. Common: "Time Profiler", "CPU Counters",
     /// "System Trace", "Allocations".
     #[arg(long, short = 't', default_value = "Time Profiler")]
     template: String,
-
     /// `KEY=VALUE` env vars forwarded to the launched binary; repeat for many.
     #[arg(long = "env", short = 'e', value_name = "KEY=VALUE")]
     env: Vec<String>,
-
     /// Binary to launch, followed by its args after `--`.
     #[arg(required = true, last = true)]
     target: Vec<OsString>,
@@ -98,27 +90,20 @@ struct RecordArgs {
 #[derive(clap::Args, Debug)]
 struct CountersArgs {
     trace: PathBuf,
-
     #[arg(long)]
     pid: Option<i64>,
-
     /// Show top N hottest PCs.
     #[arg(long, default_value_t = 25)]
     top: usize,
-
     /// Sort by counter index N instead of sample count.
     #[arg(long)]
     sort_by: Option<usize>,
-
     #[arg(long)]
     binary: Option<PathBuf>,
-
     #[arg(long)]
     dsym: Option<PathBuf>,
-
     #[arg(long, value_parser = parse_u64)]
     slide: Option<u64>,
-
     #[arg(long)]
     json: bool,
 }
@@ -126,53 +111,54 @@ struct CountersArgs {
 #[derive(clap::Args, Debug)]
 struct AnnotateArgs {
     trace: PathBuf,
-
     /// Function name to annotate (matches mangled or demangled names; partial
     /// substring match is allowed).
     #[arg(long)]
     function: String,
-
     #[arg(long)]
     binary: Option<PathBuf>,
-
     #[arg(long)]
     dsym: Option<PathBuf>,
-
     #[arg(long, value_parser = parse_u64)]
     slide: Option<u64>,
-
     #[arg(long)]
     pid: Option<i64>,
-
     /// Show every instruction, not just sampled ones.
     #[arg(long)]
     show_zero: bool,
-
     /// Prepend this directory to relative source-file paths.
     #[arg(long)]
     source_root: Option<PathBuf>,
-
     /// Output mode.
     /// `instructions`: per-instruction overlay + source-snippet hot block (default).
     /// `source`: just the annotate-snippets source-line callouts.
     /// `interleaved`: source line headers grouping the asm that came from each.
     #[arg(long, value_enum, default_value_t = CliAnnotateMode::Instructions)]
     mode: CliAnnotateMode,
-
     /// Overlay a CPU-Counters metric (per-PC delta sum) instead of raw
     /// sample counts. The index matches the `[N] <name>` legend printed
-    /// by `xct2cli counters`. Requires a CPU Counters trace.
+    /// by `xct2cli events`. Requires a CPU Counters trace.
     #[arg(long, conflicts_with = "event")]
     metric: Option<usize>,
-
     /// Overlay PMI-overflow sample counts for the given event name
-    /// (e.g. `l1d_load_miss`, `l1d_store_miss`, `l1d_tlb_miss`). Requires
-    /// a CPU Counters trace recorded in a sampling mode (e.g. L1D Miss).
+    /// (e.g. `l1d_load_miss`, `PL2_CACHE_MISS_LD`). Requires a CPU
+    /// Counters trace recorded in a sampling mode.
     #[arg(long, conflicts_with = "metric")]
     event: Option<String>,
-
     #[arg(long)]
     json: bool,
+}
+
+impl AnnotateArgs {
+    fn weight(&self) -> Weight {
+        if let Some(name) = &self.event {
+            Weight::PmiEvent { name: name.clone() }
+        } else if let Some(idx) = self.metric {
+            Weight::Metric { index: idx }
+        } else {
+            Weight::Samples
+        }
+    }
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -195,20 +181,15 @@ impl From<CliAnnotateMode> for AnnotateMode {
 #[derive(clap::Args, Debug)]
 struct SlideArgs {
     trace: PathBuf,
-
     #[arg(long)]
     binary: Option<PathBuf>,
-
     #[arg(long)]
     dsym: Option<PathBuf>,
-
     #[arg(long)]
     pid: Option<i64>,
-
     /// Show this many top candidates.
     #[arg(long, default_value_t = 10)]
     top: usize,
-
     #[arg(long)]
     json: bool,
 }
@@ -217,7 +198,6 @@ struct SlideArgs {
 struct TocArgs {
     /// Path to a `.trace` bundle.
     trace: PathBuf,
-
     #[arg(long)]
     json: bool,
 }
@@ -225,39 +205,31 @@ struct TocArgs {
 #[derive(clap::Args, Debug)]
 struct HotspotsArgs {
     trace: PathBuf,
-
     /// Restrict to samples from this PID. Defaults to the launched target.
     #[arg(long)]
     pid: Option<i64>,
-
     /// Timeline bucket width in milliseconds.
     #[arg(long, default_value_t = 10)]
     bucket_ms: u64,
-
     /// Show top N hottest program counters.
     #[arg(long, default_value_t = 25)]
     top: usize,
-
     /// Restrict to a time window, in `START..END` milliseconds since the
     /// first sample (e.g. `0..500`).
     #[arg(long)]
     window_ms: Option<String>,
-
-    /// Path to the launched binary (for symbol resolution). Inferred
-    /// from the trace's process info when omitted.
+    /// Path to the launched binary (for symbol resolution). Inferred from
+    /// the trace's process info when omitted.
     #[arg(long)]
     binary: Option<PathBuf>,
-
     /// Path to a `.dSYM` bundle (or its inner DWARF file). Optional;
     /// addr2line will also pick up DWARF embedded in the binary.
     #[arg(long)]
     dsym: Option<PathBuf>,
-
     /// ASLR slide subtracted from runtime PCs before DWARF lookup.
-    /// Hex (`0x...`) or decimal. Defaults to 0.
+    /// Hex (`0x...`) or decimal. When omitted, auto-detected from kdebug.
     #[arg(long, value_parser = parse_u64)]
     slide: Option<u64>,
-
     #[arg(long)]
     json: bool,
 }
@@ -277,12 +249,19 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+fn slide_mode(slide: Option<u64>) -> SlideMode {
+    match slide {
+        Some(s) => SlideMode::Manual(Slide::new(s)),
+        None => SlideMode::Auto,
+    }
+}
+
 fn run_events(args: EventsArgs) -> anyhow::Result<()> {
     let bundle = TraceBundle::open(&args.trace).context("opening trace bundle")?;
 
-    let metrics = metric_labels(&bundle).unwrap_or_default();
+    let metrics = bundle.metric_labels().unwrap_or_default();
     let mut events: BTreeMap<String, u64> = BTreeMap::new();
-    if let Ok(samples) = read_pmi_samples(&bundle, None) {
+    if let Ok(samples) = bundle.pmi_samples(None) {
         for s in samples {
             *events.entry(s.event).or_insert(0) += 1;
         }
@@ -299,6 +278,7 @@ fn run_events(args: EventsArgs) -> anyhow::Result<()> {
                 .iter()
                 .map(|(name, count)| serde_json::json!({"name": name, "samples": count}))
                 .collect::<Vec<_>>(),
+            "counters_profile_event": bundle.counters_profile_event().ok().flatten(),
         });
         serde_json::to_writer_pretty(std::io::stdout().lock(), &payload)?;
         println!();
@@ -325,7 +305,7 @@ fn run_events(args: EventsArgs) -> anyhow::Result<()> {
         }
     }
 
-    if let Ok(Some(name)) = counters_profile_event(&bundle) {
+    if let Ok(Some(name)) = bundle.counters_profile_event() {
         println!();
         println!("counters-profile event (Manual-mode template; use `annotate --event {name}`):");
         println!("  {name}    (PCs recovered by nearest-timestamp join with time-sample)");
@@ -365,7 +345,7 @@ fn run_counters(args: CountersArgs) -> anyhow::Result<()> {
     let bundle = TraceBundle::open(&args.trace).context("opening trace bundle")?;
     let mut builder = CountersBuilder::new(&bundle).top(args.top);
     if let Some(pid) = args.pid {
-        builder = builder.pid(pid);
+        builder = builder.pid(Pid::new(pid));
     }
     if let Some(idx) = args.sort_by {
         builder = builder.sort_by_index(idx);
@@ -374,32 +354,34 @@ fn run_counters(args: CountersArgs) -> anyhow::Result<()> {
         Some(b) => Some(b),
         None => infer_binary_from_toc(&bundle).unwrap_or(None),
     };
-    builder = builder.binary(binary).dsym(args.dsym).slide(args.slide);
+    builder = builder
+        .binary(binary)
+        .dsym(args.dsym)
+        .slide(slide_mode(args.slide));
     let report = builder.run().context("building counter report")?;
     if args.json {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
         println!();
     } else {
-        print!("{}", render::render_counters(&report));
+        print!("{}", report.to_text());
     }
     Ok(())
 }
 
 fn run_annotate(args: AnnotateArgs) -> anyhow::Result<()> {
     let bundle = TraceBundle::open(&args.trace).context("opening trace bundle")?;
-    let binary = match args.binary {
+    let binary = match args.binary.clone() {
         Some(b) => b,
         None => infer_binary_from_toc(&bundle)?
             .ok_or_else(|| anyhow::anyhow!("no --binary and TOC has no usable process path"))?,
     };
     let opts = AnnotateOptions {
-        function: args.function,
+        function: args.function.clone(),
         binary,
-        dsym: args.dsym,
-        slide: args.slide,
-        pid: args.pid,
-        metric: args.metric,
-        event: args.event,
+        dsym: args.dsym.clone(),
+        slide: slide_mode(args.slide),
+        pid: args.pid.map(Pid::new),
+        weight: args.weight(),
     };
     let func = annotate(&bundle, opts).context("annotating function")?;
     if args.json {
@@ -411,7 +393,7 @@ fn run_annotate(args: AnnotateArgs) -> anyhow::Result<()> {
             source_root: args.source_root,
             mode: args.mode.into(),
         };
-        let text = render::render_annotated(&func, &render_opts)?;
+        let text = func.render(&render_opts)?;
         print!("{}", text);
     }
     Ok(())
@@ -425,20 +407,23 @@ fn run_slide(args: SlideArgs) -> anyhow::Result<()> {
     };
     let binary = binary
         .ok_or_else(|| anyhow::anyhow!("no --binary given and TOC has no usable process path"))?;
-    let info = binary_info(&binary).context("reading Mach-O binary info")?;
-    let loads = read_image_loads(&bundle).context("reading kdebug image-load events")?;
-    let kdebug_slide = slide_from_kdebug(&info, &loads);
+    let info = BinaryInfo::open(&binary).context("reading Mach-O binary info")?;
+    let loads = bundle
+        .image_loads()
+        .context("reading kdebug image-load events")?;
+    let kdebug_slide = info.slide_from(&loads);
 
-    let pcs = collect_pc_samples(&bundle, args.pid).context("collecting PC samples")?;
-    let weighted: Vec<(u64, u64)> = pcs.iter().map(|s| (s.pc, s.samples)).collect();
+    let pcs = bundle
+        .pc_samples(args.pid.map(Pid::new))
+        .context("collecting PC samples")?;
     let dwarf = args.dsym.as_deref().unwrap_or(binary.as_path());
-    let candidates = enumerate_slides(&info, &weighted, dwarf);
+    let candidates = info.enumerate_slides(&pcs, dwarf);
     let take: Vec<_> = candidates.into_iter().take(args.top).collect();
 
     if args.json {
         let payload = serde_json::json!({
             "binary": binary,
-            "uuid": info.uuid.map(|u| format!("{:x?}", u)),
+            "uuid": info.uuid.map(|u| format_uuid(&u)),
             "kdebug_slide": kdebug_slide,
             "candidates": take,
             "image_loads": loads,
@@ -452,14 +437,11 @@ fn run_slide(args: SlideArgs) -> anyhow::Result<()> {
     if let Some(uuid) = info.uuid {
         println!("uuid:   {}", format_uuid(&uuid));
     }
-    println!("text:   0x{:x}..0x{:x}", info.text_start, info.text_end);
+    println!("text:   {}..{}", info.text_start, info.text_end);
     println!("pcs in trace: {} unique", pcs.len());
     println!();
     if let Some(s) = kdebug_slide {
-        println!(
-            "kdebug DBG_DYLD slide: 0x{:x}   (recommended; matched by UUID)",
-            s
-        );
+        println!("kdebug DBG_DYLD slide: {s}   (recommended; matched by UUID)");
     } else {
         println!(
             "kdebug DBG_DYLD slide: not found ({} image-load events in trace, none matched the binary's UUID)",
@@ -469,14 +451,18 @@ fn run_slide(args: SlideArgs) -> anyhow::Result<()> {
     println!();
     println!("Heuristic candidates (use only if kdebug detection failed):");
     println!(
-        "{:<12}  {:>9}  {:>9}  {:>10}  function",
+        "{:<14}  {:>9}  {:>9}  {:>10}  function",
         "slide", "covered", "top", "fn-bytes"
     );
     for c in &take {
         let name = c.top_function_name.as_deref().unwrap_or("?");
         println!(
-            "0x{:010x}  {:>9}  {:>9}  {:>10}  {}",
-            c.slide, c.covered_samples, c.top_function_samples, c.top_function_size, name
+            "{:<14}  {:>9}  {:>9}  {:>10}  {}",
+            format!("{}", c.slide),
+            c.covered_samples,
+            c.top_function_samples,
+            c.top_function_size,
+            name
         );
     }
     Ok(())
@@ -524,7 +510,7 @@ fn run_toc(args: TocArgs) -> anyhow::Result<()> {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &toc)?;
         println!();
     } else {
-        print!("{}", render::render_toc(&toc));
+        print!("{}", toc.to_text());
     }
     Ok(())
 }
@@ -535,7 +521,7 @@ fn run_hotspots(args: HotspotsArgs) -> anyhow::Result<()> {
         .bucket_ns(args.bucket_ms.saturating_mul(1_000_000))
         .top(args.top);
     if let Some(pid) = args.pid {
-        builder = builder.pid(pid);
+        builder = builder.pid(Pid::new(pid));
     }
     if let Some(window) = &args.window_ms {
         let (lo, hi) = parse_window_ms(window).context("parsing --window-ms")?;
@@ -545,13 +531,16 @@ fn run_hotspots(args: HotspotsArgs) -> anyhow::Result<()> {
         Some(b) => Some(b),
         None => infer_binary_from_toc(&bundle).unwrap_or(None),
     };
-    builder = builder.binary(binary).dsym(args.dsym).slide(args.slide);
+    builder = builder
+        .binary(binary)
+        .dsym(args.dsym)
+        .slide(slide_mode(args.slide));
     let report = builder.run().context("building hotspot report")?;
     if args.json {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
         println!();
     } else {
-        print!("{}", render::render_hotspots(&report));
+        print!("{}", report.to_text());
     }
     Ok(())
 }

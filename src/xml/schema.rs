@@ -19,14 +19,17 @@ pub struct Column {
     pub engineering_type: EngineeringType,
 }
 
-/// Wraps the `<engineering-type>` text. Kept open-ended because Apple
-/// adds new types between Xcode releases; `EngineeringType::known()`
-/// covers the ones we model explicitly.
+/// xctrace's internal type tag (e.g. `sample-time`, `kperf-bt`).
+/// Open-ended because Apple adds new tags between Xcode releases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
-pub struct EngineeringType(pub String);
+pub struct EngineeringType(String);
 
 impl EngineeringType {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

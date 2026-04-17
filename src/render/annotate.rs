@@ -27,11 +27,14 @@ pub struct AnnotateRenderOptions {
     pub mode: AnnotateMode,
 }
 
-pub fn render_annotated(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -> Result<String> {
-    match opts.mode {
-        AnnotateMode::Instructions => render_instructions(func, opts),
-        AnnotateMode::Source => render_source_only(func, opts),
-        AnnotateMode::Interleaved => render_interleaved(func, opts),
+impl AnnotatedFunction {
+    /// Render the disassembly + source overlay according to `opts`.
+    pub fn render(&self, opts: &AnnotateRenderOptions) -> Result<String> {
+        match opts.mode {
+            AnnotateMode::Instructions => render_instructions(self, opts),
+            AnnotateMode::Source => render_source_only(self, opts),
+            AnnotateMode::Interleaved => render_interleaved(self, opts),
+        }
     }
 }
 
@@ -144,7 +147,7 @@ fn write_header(out: &mut String, func: &AnnotatedFunction) {
         func.demangled_name,
         func.total_samples,
         func.weight_label,
-        func.runtime_end - func.runtime_start
+        func.runtime_end.raw() - func.runtime_start.raw()
     );
     let _ = writeln!(out, "  binary:  {}", func.binary.display());
     let _ = writeln!(

@@ -10,6 +10,10 @@ use object::ObjectSymbol;
 use object::SymbolKind;
 use serde::Serialize;
 
+use crate::address::FilePc;
+use crate::address::RuntimePc;
+use crate::address::Slide;
+use crate::analysis::PcSample;
 use crate::error::Error;
 use crate::error::Result;
 use crate::trace::TraceBundle;
@@ -21,20 +25,19 @@ use crate::xml::stream::RowReaderEvent;
 pub struct SymbolicatorOptions {
     pub binary: Option<PathBuf>,
     pub dsym: Option<PathBuf>,
-    /// Subtracted from runtime PCs before lookup. Use this when the
-    /// binary was loaded with ASLR offset (slide).
-    pub slide: u64,
+    /// Subtracted from runtime PCs before lookup. Use when the binary
+    /// was loaded with an ASLR offset.
+    pub slide: Slide,
 }
 
 pub struct Symbolicator {
     loader: Option<Loader>,
-    slide: u64,
-    binary: Option<PathBuf>,
+    slide: Slide,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolicatedFrame {
-    pub address: u64,
+    pub address: RuntimePc,
     pub function: Option<String>,
     pub file: Option<String>,
     pub line: Option<u32>,
@@ -59,19 +62,10 @@ impl Symbolicator {
         Ok(Self {
             loader,
             slide: opts.slide,
-            binary: opts.binary,
         })
     }
 
-    pub fn binary(&self) -> Option<&Path> {
-        self.binary.as_deref()
-    }
-
-    pub fn slide(&self) -> u64 {
-        self.slide
-    }
-
-    pub fn resolve(&self, runtime_pc: u64) -> Result<SymbolicatedFrame> {
+    pub fn resolve(&self, runtime_pc: RuntimePc) -> Result<SymbolicatedFrame> {
         let mut frame = SymbolicatedFrame {
             address: runtime_pc,
             function: None,
@@ -83,16 +77,17 @@ impl Symbolicator {
         let Some(loader) = &self.loader else {
             return Ok(frame);
         };
-        let Some(probe) = runtime_pc.checked_sub(self.slide) else {
+        let Some(probe) = runtime_pc.to_file(self.slide) else {
             return Ok(frame);
         };
+        let probe_raw = probe.raw();
 
-        if let Some(sym) = loader.find_symbol_info(probe) {
+        if let Some(sym) = loader.find_symbol_info(probe_raw) {
             frame.function = Some(demangle(sym.name()));
         }
 
         let mut iter = loader
-            .find_frames(probe)
+            .find_frames(probe_raw)
             .map_err(|e| Error::Addr2Line(e.to_string()))?;
         let mut innermost: Option<addr2line::Frame<'_, _>> = None;
         let mut inlined: Vec<InlinedFrame> = Vec::new();
@@ -133,93 +128,184 @@ fn load(path: &Path) -> Result<Loader> {
 
 #[derive(Debug, Clone)]
 pub struct BinaryInfo {
-    /// Preferred VM address of `__text` (the executable section).
-    pub text_start: u64,
-    pub text_end: u64,
-    /// Preferred VM address of the `__TEXT` segment (i.e. of the Mach-O
-    /// header). Used to convert kdebug-reported load addresses into a slide.
-    pub segment_text_start: u64,
-    /// Sorted ascending. Each entry is the file address of a function symbol
-    /// in `__text`.
-    pub function_addrs: Vec<u64>,
+    /// Preferred VM address of the `__text` section (executable code).
+    pub text_start: FilePc,
+    pub text_end: FilePc,
+    /// Preferred VM address of the `__TEXT` segment (Mach-O header).
+    /// Used to convert kdebug-reported load addresses into a slide.
+    pub segment_text_start: FilePc,
+    /// Sorted ascending. File addresses of function symbols in `__text`.
+    pub function_addrs: Vec<FilePc>,
     /// The binary's `LC_UUID`.
     pub uuid: Option<[u8; 16]>,
 }
 
-/// Parse a Mach-O binary for the data needed to detect ASLR slide.
-pub fn binary_info(binary: &Path) -> Result<BinaryInfo> {
-    let data = std::fs::read(binary)?;
-    let file = object::File::parse(&*data)?;
-    let mut segment_text_start = u64::MAX;
-    let mut segment_text_end: u64 = 0;
-    for seg in file.segments() {
-        if let Some(name) = seg.name()?
-            && name == "__TEXT"
-        {
-            segment_text_start = seg.address();
-            segment_text_end = segment_text_start + seg.size();
+impl BinaryInfo {
+    /// Parse a Mach-O binary for the data needed to detect ASLR slide.
+    pub fn open(binary: &Path) -> Result<Self> {
+        let data = std::fs::read(binary)?;
+        let file = object::File::parse(&*data)?;
+        let mut segment_text_start: Option<u64> = None;
+        let mut segment_text_end: u64 = 0;
+        for seg in file.segments() {
+            if let Some(name) = seg.name()?
+                && name == "__TEXT"
+            {
+                segment_text_start = Some(seg.address());
+                segment_text_end = seg.address() + seg.size();
+            }
         }
+        let (text_start_raw, text_end_raw) = match file.section_by_name("__text") {
+            Some(sec) => (sec.address(), sec.address() + sec.size()),
+            None => (segment_text_start.unwrap_or(0), segment_text_end),
+        };
+        if text_end_raw <= text_start_raw {
+            return Err(Error::Schema("binary has no __TEXT segment".into()));
+        }
+        let mut function_addrs: Vec<FilePc> = file
+            .symbols()
+            .filter(|s| s.kind() == SymbolKind::Text)
+            .map(|s| s.address())
+            .filter(|a| *a >= text_start_raw && *a < text_end_raw)
+            .map(FilePc::new)
+            .collect();
+        function_addrs.sort();
+        function_addrs.dedup();
+        let uuid = file.mach_uuid()?;
+        let segment_text_start = FilePc::new(segment_text_start.unwrap_or(text_start_raw));
+        Ok(BinaryInfo {
+            text_start: FilePc::new(text_start_raw),
+            text_end: FilePc::new(text_end_raw),
+            segment_text_start,
+            function_addrs,
+            uuid,
+        })
     }
-    let (text_start, text_end) = match file.section_by_name("__text") {
-        Some(sec) => (sec.address(), sec.address() + sec.size()),
-        None => (segment_text_start, segment_text_end),
-    };
-    if text_end <= text_start {
-        return Err(Error::Schema("binary has no __TEXT segment".into()));
-    }
-    let mut function_addrs: Vec<u64> = file
-        .symbols()
-        .filter(|s| s.kind() == SymbolKind::Text)
-        .map(|s| s.address())
-        .filter(|a| *a >= text_start && *a < text_end)
-        .collect();
-    function_addrs.sort_unstable();
-    function_addrs.dedup();
-    let uuid = file.mach_uuid()?;
-    let segment_text_start = if segment_text_start == u64::MAX {
-        text_start
-    } else {
-        segment_text_start
-    };
-    Ok(BinaryInfo {
-        text_start,
-        text_end,
-        segment_text_start,
-        function_addrs,
-        uuid,
-    })
-}
 
-/// Read every `DBG_DYLD_UUID_MAP_A` event from the trace and decode the
-/// (UUID, runtime load address) pairs. These events are kernel ground
-/// truth — when dyld maps an image, the kernel records the runtime base
-/// address it chose under ASLR.
-///
-/// Class 31 (`DBG_DYLD`), subclass 5 (`DBG_DYLD_UUID`), code 0
-/// (`MAP_A`). Args 1 and 2 are the UUID's two halves as little-endian
-/// `u64`s; arg 3 is the runtime load address.
-pub fn read_image_loads(bundle: &TraceBundle) -> Result<Vec<ImageLoad>> {
-    let xml = bundle
-        .xctrace()
-        .export_xpath(bundle.path(), DBG_DYLD_XPATH)?;
-    let mut reader = RowReader::new(std::io::Cursor::new(xml));
-    let mut out: Vec<ImageLoad> = Vec::new();
-    while let Some(ev) = reader.next_event()? {
-        let RowReaderEvent::Row(cells) = ev else {
-            continue;
-        };
-        let Some(decoded) = decode_dyld_map_a(&cells) else {
-            continue;
-        };
-        out.push(decoded);
+    /// Look up the slide by matching this binary's `LC_UUID` against the
+    /// trace's recorded image loads. Returns `None` if the UUID isn't in
+    /// `loads` or the binary has no UUID.
+    pub fn slide_from(&self, loads: &[ImageLoad]) -> Option<Slide> {
+        let uuid = self.uuid?;
+        let load = loads.iter().find(|l| l.uuid == uuid)?;
+        load.load_address
+            .raw()
+            .checked_sub(self.segment_text_start.raw())
+            .map(Slide::new)
     }
-    Ok(out)
+
+    /// Heuristic enumeration of plausible page-aligned ASLR slides.
+    /// Provided as a fallback for traces with no kdebug DBG_DYLD events.
+    /// Ranking is heuristic; multiple slides will look equally valid for
+    /// short traces or stripped binaries.
+    pub fn enumerate_slides(
+        &self,
+        pcs_with_weight: &[PcSample],
+        dwarf_path: &Path,
+    ) -> Vec<SlideCandidate> {
+        const PAGE: u64 = 0x4000;
+        let resolved = resolve_dsym(dwarf_path);
+        let loader = Loader::new(&resolved).ok();
+        let text_start = self.text_start.raw();
+        let text_end = self.text_end.raw();
+
+        let mut candidates: HashMap<u64, ()> = HashMap::new();
+        for s in pcs_with_weight {
+            let pc = s.pc.raw();
+            if pc < text_start {
+                continue;
+            }
+            let max_slide = pc.saturating_sub(text_start);
+            let min_slide = pc.saturating_sub(text_end.saturating_sub(1));
+            let max_aligned = max_slide & !(PAGE - 1);
+            let min_aligned = (min_slide + PAGE - 1) & !(PAGE - 1);
+            let mut s = min_aligned;
+            while s <= max_aligned {
+                candidates.insert(s, ());
+                s = match s.checked_add(PAGE) {
+                    Some(v) => v,
+                    None => break,
+                };
+            }
+        }
+
+        let func_addrs_raw: Vec<u64> = self.function_addrs.iter().map(|f| f.raw()).collect();
+        let mut out: Vec<SlideCandidate> = Vec::new();
+        for slide in candidates.into_keys() {
+            let mut per_func: HashMap<u64, u64> = HashMap::new();
+            let mut covered: u64 = 0;
+            for s in pcs_with_weight {
+                let Some(probe) = s.pc.raw().checked_sub(slide) else {
+                    continue;
+                };
+                let Some(func_start) = function_containing(&func_addrs_raw, probe, text_end) else {
+                    continue;
+                };
+                *per_func.entry(func_start).or_insert(0) += s.samples;
+                covered += s.samples;
+            }
+            if covered == 0 {
+                continue;
+            }
+            let mut entries: Vec<(u64, u64)> = per_func.into_iter().collect();
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            let (top_addr, top_share) = entries[0];
+            let func_len = function_length(&func_addrs_raw, top_addr, text_end);
+            let top_function_name = loader.as_ref().and_then(|l| top_function_at(l, top_addr));
+            out.push(SlideCandidate {
+                slide: Slide::new(slide),
+                covered_samples: covered,
+                top_function_samples: top_share,
+                top_function_address: FilePc::new(top_addr),
+                top_function_size: func_len,
+                top_function_name,
+            });
+        }
+        out.sort_by(|a, b| {
+            b.top_function_samples
+                .cmp(&a.top_function_samples)
+                .then_with(|| a.top_function_size.cmp(&b.top_function_size))
+        });
+        out
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ImageLoad {
     pub uuid: [u8; 16],
-    pub load_address: u64,
+    pub load_address: RuntimePc,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SlideCandidate {
+    pub slide: Slide,
+    pub covered_samples: u64,
+    pub top_function_samples: u64,
+    pub top_function_address: FilePc,
+    pub top_function_size: u64,
+    pub top_function_name: Option<String>,
+}
+
+impl TraceBundle {
+    /// Read every `DBG_DYLD_UUID_MAP_A` event from the trace and decode
+    /// the (UUID, runtime load address) pairs. These events are kernel
+    /// ground truth — when dyld maps an image, the kernel records the
+    /// runtime base address it chose under ASLR.
+    pub fn image_loads(&self) -> Result<Vec<ImageLoad>> {
+        let xml = self.xctrace().export_xpath(self.path(), DBG_DYLD_XPATH)?;
+        let mut reader = RowReader::new(std::io::Cursor::new(xml));
+        let mut out: Vec<ImageLoad> = Vec::new();
+        while let Some(ev) = reader.next_event()? {
+            let RowReaderEvent::Row(cells) = ev else {
+                continue;
+            };
+            let Some(decoded) = decode_dyld_map_a(&cells) else {
+                continue;
+            };
+            out.push(decoded);
+        }
+        Ok(out)
+    }
 }
 
 const DBG_DYLD_XPATH: &str = "/trace-toc/run[@number=\"1\"]/data/table[@schema=\"kdebug\"]";
@@ -254,100 +340,8 @@ fn decode_dyld_map_a(cells: &[std::rc::Rc<Cell>]) -> Option<ImageLoad> {
     uuid[8..16].copy_from_slice(&args[1].to_le_bytes());
     Some(ImageLoad {
         uuid,
-        load_address: args[2],
+        load_address: RuntimePc::new(args[2]),
     })
-}
-
-/// Look up the slide for a Mach-O binary by matching its `LC_UUID`
-/// against the trace's recorded image loads. Returns the slide as
-/// `(load_address - segment_text_start)`.
-pub fn slide_from_kdebug(info: &BinaryInfo, loads: &[ImageLoad]) -> Option<u64> {
-    let uuid = info.uuid?;
-    let load = loads.iter().find(|l| l.uuid == uuid)?;
-    load.load_address.checked_sub(info.segment_text_start)
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SlideCandidate {
-    pub slide: u64,
-    pub covered_samples: u64,
-    pub top_function_samples: u64,
-    pub top_function_address: u64,
-    pub top_function_size: u64,
-    pub top_function_name: Option<String>,
-}
-
-/// Enumerate plausible page-aligned ASLR slides that map the sampled PCs
-/// into the binary's `__text` segment. Returns candidates sorted by a
-/// heuristic ranking, but **the ranking is not authoritative** — for
-/// stripped binaries or short traces multiple slides will look equally
-/// plausible. The CLI surfaces this list for a human to pick from.
-pub fn enumerate_slides(
-    info: &BinaryInfo,
-    pcs_with_weight: &[(u64, u64)],
-    dwarf_path: &Path,
-) -> Vec<SlideCandidate> {
-    const PAGE: u64 = 0x4000;
-    let resolved = resolve_dsym(dwarf_path);
-    let loader = Loader::new(&resolved).ok();
-
-    let mut candidates: HashMap<u64, ()> = HashMap::new();
-    for &(pc, _) in pcs_with_weight {
-        if pc < info.text_start {
-            continue;
-        }
-        let max_slide = pc.saturating_sub(info.text_start);
-        let min_slide = pc.saturating_sub(info.text_end.saturating_sub(1));
-        let max_aligned = max_slide & !(PAGE - 1);
-        let min_aligned = (min_slide + PAGE - 1) & !(PAGE - 1);
-        let mut s = min_aligned;
-        while s <= max_aligned {
-            candidates.insert(s, ());
-            s = match s.checked_add(PAGE) {
-                Some(v) => v,
-                None => break,
-            };
-        }
-    }
-
-    let mut out: Vec<SlideCandidate> = Vec::new();
-    for slide in candidates.into_keys() {
-        let mut per_func: HashMap<u64, u64> = HashMap::new();
-        let mut covered: u64 = 0;
-        for &(pc, w) in pcs_with_weight {
-            let Some(probe) = pc.checked_sub(slide) else {
-                continue;
-            };
-            let Some(func_start) = function_containing(&info.function_addrs, probe, info.text_end)
-            else {
-                continue;
-            };
-            *per_func.entry(func_start).or_insert(0) += w;
-            covered += w;
-        }
-        if covered == 0 {
-            continue;
-        }
-        let mut entries: Vec<(u64, u64)> = per_func.into_iter().collect();
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
-        let (top_addr, top_share) = entries[0];
-        let func_len = function_length(&info.function_addrs, top_addr, info.text_end);
-        let top_function_name = loader.as_ref().and_then(|l| top_function_at(l, top_addr));
-        out.push(SlideCandidate {
-            slide,
-            covered_samples: covered,
-            top_function_samples: top_share,
-            top_function_address: top_addr,
-            top_function_size: func_len,
-            top_function_name,
-        });
-    }
-    out.sort_by(|a, b| {
-        b.top_function_samples
-            .cmp(&a.top_function_samples)
-            .then_with(|| a.top_function_size.cmp(&b.top_function_size))
-    });
-    out
 }
 
 fn top_function_at(loader: &Loader, probe: u64) -> Option<String> {
@@ -397,11 +391,7 @@ fn resolve_dsym(path: &Path) -> PathBuf {
     if candidates.is_empty() {
         return path.to_path_buf();
     }
-    candidates.sort_by_key(|p| {
-        std::fs::metadata(p)
-            .and_then(|m| m.len().try_into().or(Ok(0u64)))
-            .unwrap_or(0)
-    });
+    candidates.sort_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0));
     candidates.pop().unwrap()
 }
 
