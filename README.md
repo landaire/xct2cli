@@ -1,22 +1,17 @@
 # xct2cli
 
-Library and CLI for transforming Xcode Instruments `.trace` bundles into
-output that's useful to humans **and** LLMs. Apple Silicon only.
+Library and CLI for transforming Xcode Instruments `.trace` bundles
+into output that's useful to humans **and** LLMs. Apple Silicon only.
 
 The crate is library-forward: `xct2cli` (the binary) is a thin `clap`
 shell over `xct2cli` (the lib). Other tools can depend on the lib with
 `default-features = false` to skip the CLI deps.
 
-**NOTE:** This is kind of some LLM bullshit. I kept having Claude Code use Instruments to profile code and it would always create a Python script to interpret the results. This project is my attempt to kill the Python script it would always generate, and get richer info at the same time.
-
-## Why
-
-Instruments and `xctrace` are not super LLM-friendly. `xctrace` exports
-data as XML, but it still requires a lot of XPath probing and
-schema-specific knowledge to get useful output. `xct2cli` does the
-parsing, the symbolication, the per-CPU counter joins, and the
-per-instruction inlining attribution for you, and prints something both
-a human and an LLM can read.
+**NOTE:** This is kind of some LLM bullshit. I kept having Claude Code
+use Instruments to profile code and it would always create a Python
+script to interpret the results. This project is my attempt to kill the
+Python script it would always generate, and get richer info at the same
+time.
 
 ## Requirements
 
@@ -38,54 +33,89 @@ xct2cli record    -t TEMPLATE -o OUT.trace -- ./bin args
 
 Global flags: `--color {auto,always,never}` (auto-detect TTY + honor
 `NO_COLOR`), `--verbose`, `--json` on every command for
-machine-readable output (color is suppressed in JSON mode).
+machine-readable output. ASLR slide is recovered automatically from the
+trace's kdebug image-load events whenever `--binary` or `--dsym` is
+provided; `xct2cli slide` is the escape hatch when that fails.
 
-## End-to-end example (`lzxc` benchmark)
+## Time profile (Time Profiler trace)
 
 ```sh
-# record a Time Profiler trace
 xct2cli record -t "Time Profiler" -o /tmp/run.trace -- \
     target/release/examples/profile_compress
-
-# what's in it?
 xct2cli toc /tmp/run.trace
+```
 
-# top hotspots, auto-symbolicated against the launched binary
+```
+run #1
+  template: Time Profiler
+  duration: 1.354983s
+  device:   caladan (MacBook Pro, 26.4 (25E246))
+  process:  profile_compress (pid 85408)
+  processes:
+    pid     0  kernel  /System/Library/Kernels/kernel.release.t8142
+    pid 85408  profile_compress  /Users/lander/dev/acceleration/target/release/examples/profile_compress
+  tables (40):
+    tick
+    time-sample
+    time-profile
+    kdebug
+    ...
+```
+
+```sh
 xct2cli hotspots /tmp/run.trace
+```
 
-# disassemble a function with per-instruction sample counts grouped by
-# source line — the inlined-from layer surfaces find_best_match's lines
-# even though they were inlined into MatchFinder::process
+```
+samples: 500
+per CPU:
+  CPU 0 CPU 0 (E Core)              1 samples
+  CPU 6 CPU 6 (S Core)            152 samples
+  CPU 7 CPU 7 (S Core)            118 samples
+  CPU 8 CPU 8 (S Core)            111 samples
+  CPU 9 CPU 9 (S Core)            118 samples
+
+timeline (10ms buckets, 51 buckets):
+  ms_off cpu0 cpu6 cpu7 cpu8 cpu9
+       0     0     2     1     3     2
+      40     0     6     0     4     0
+      70     0     9     0     0     1
+     130     0     8     2     0     0
+     ...
+
+top 25 PCs:
+      94  0x0000000100ac249c  lzxc::match_finder::MatchFinder::process  match_finder.rs:202
+      68  0x0000000100ac237c  lzxc::match_finder::MatchFinder::process  match_finder.rs:182
+      38  0x0000000100ac2460  lzxc::match_finder::MatchFinder::process  match_finder.rs
+      31  0x0000000100ac236c  lzxc::match_finder::MatchFinder::process  match_finder.rs:182
+       ...
+```
+
+Then drill into the hottest function:
+
+```sh
 xct2cli annotate /tmp/run.trace --function MatchFinder::process --mode interleaved
 ```
 
-`hotspots` produces a per-CPU sample summary, a 10-ms-bucket burst
-timeline, and the top-N hottest PCs resolved to `function file:line` via
-DWARF. ASLR slide is recovered automatically from kdebug events when a
-binary or dSYM is provided.
+`--mode interleaved` groups consecutive instructions by their innermost
+inlined source location, prints stats + function + source per group,
+then the asm:
 
-`annotate` has three modes:
+```
+[931 samples / 3 insns]  lzxc::match_finder::MatchFinder::find_best_match  match_finder.rs:278    inlined into MatchFinder::process at match_finder.rs:182
+    let next_candidate_abs = prev[c_rel] as u64;
+          931  ##########  0x10250e378  ldr w15, [x22, x11, lsl #2]
+```
 
-- `--mode instructions` (default) — every sampled instruction with its
-  asm + source-line comment, plus an `annotate-snippets` block per
-  source file showing the hot lines.
-- `--mode source` — just the `annotate-snippets` source-line callouts.
-- `--mode interleaved` — source-grouped: each contiguous run of
-  instructions sharing a source line gets its own block with stats,
-  function (innermost inlined name), location, source code, and the
-  asm underneath. Best for understanding *which inlined function* the
-  hot loop actually came from.
+(`--mode source` collapses to just the `annotate-snippets` source-line
+callouts; `--mode instructions` is the asm-first default with a
+source-snippet block at the end.)
 
-`annotate --event <name>` and `annotate --metric N` swap the
-per-instruction weight from "raw samples" to "L1D misses" / "back-end
-stall events" / etc. when the trace has CPU Counters data — same code
-path, different attribution.
+## Per-instruction cache miss attribution (CPU Counters trace)
 
-## Cache thrash analysis
-
-For real per-instruction cache miss attribution, record with a
-`.tracetemplate` configured for PMI-overflow sampling on a memory
-event. Templates are checked in under `templates/`:
+For literal cache miss attribution you need a `.tracetemplate`
+configured for PMI-overflow sampling on a memory event. Two are
+checked in under `templates/`:
 
 - `templates/L1D_Miss.tracetemplate` — Apple's Guided "L1D Miss
   Sampling" mode. Captures `l1d_load_miss`, `l1d_store_miss`,
@@ -99,32 +129,10 @@ event. Templates are checked in under `templates/`:
 ```sh
 xct2cli record -t templates/L1D_Miss.tracetemplate -o /tmp/l1d.trace -- \
     target/release/examples/profile_compress
-
-# what events / counters did the trace capture?
 xct2cli events /tmp/l1d.trace
-
-# overlay literal L1D load misses per instruction
-xct2cli annotate /tmp/l1d.trace --function MatchFinder::process \
-    --event l1d_load_miss --mode interleaved
 ```
 
-The interleaved view groups instructions by their innermost inlined
-source location, so you can immediately see *which* inlined function
-generated the hot block — even when the binary symbol that contains the
-PC is something else:
-
-![L1D miss interleaved view of MatchFinder::process](img/l1d_miss.png)
-
-In this trace, 931 of 2124 L1D load misses (44%) come from a single
-`prev[c_rel]` read in `find_best_match` at `match_finder.rs:278` — the
-hash-chain walk inlined into `MatchFinder::process`.
-
-## Discovering events
-
-`xct2cli events <trace>` lists everything weight-able in the trace:
-
 ```
-$ xct2cli events /tmp/l1d.trace
 metrics (use with `annotate --metric N` or `counters --sort-by N`):
   [0]  Cycles
   [1]  L1D Cache Load Misses
@@ -137,43 +145,49 @@ pmi events (use with `annotate --event NAME`):
   l1d_tlb_miss                 20    0.5%
 ```
 
-For Manual-mode templates (e.g. the L2 one), it also lists the single
-configured event name from the trace's `counters-profile` table.
+```sh
+xct2cli annotate /tmp/l1d.trace --function MatchFinder::process \
+    --event l1d_load_miss --mode interleaved
+```
 
-## ASLR slide
+```
+function: lzxc::match_finder::MatchFinder::process (2124 l1d_load_miss samples in window, 1912 bytes)
 
-Apple Silicon binaries are PIE; their `__TEXT` is loaded at a randomised
-slide each run. The trace records `DBG_DYLD_UUID_MAP_A` kdebug events
-(class 31, subclass 5, code 0) for every loaded image: arg1+arg2 hold
-the image's UUID, arg3 holds its runtime load address. We match the
-binary's `LC_UUID` against those events to recover the slide
-deterministically.
+[301 l1d_load_miss samples / 3 insns]  lzxc::match_finder::MatchFinder::find_best_match  match_finder.rs:262    inlined into MatchFinder::process at match_finder.rs:182
+    let mut candidate_abs = head[hash] as u64;
+          301  ###         0x10250e2d4  ldr w15, [x17, x10, lsl #2]
 
-`hotspots`, `annotate`, and `counters` use this automatically when
-given `--binary` or `--dsym`. `xct2cli slide <trace>` prints the
-recovered slide alongside a fallback heuristic ranking for the rare
-case the kdebug events are absent (e.g. attached to a long-running
-process where dyld mapped the image before recording started).
+[578 l1d_load_miss samples / 1 insns]  (no source mapping)    inlined into MatchFinder::process at match_finder.rs:182
+          578  ######      0x10250e330  ldr w15, [x22, x11, lsl #2]
 
-## Building your own templates
+[931 l1d_load_miss samples / 3 insns]  lzxc::match_finder::MatchFinder::find_best_match  match_finder.rs:278    inlined into MatchFinder::process at match_finder.rs:182
+    let next_candidate_abs = prev[c_rel] as u64;
+          931  ##########  0x10250e378  ldr w15, [x22, x11, lsl #2]
+```
 
-`xctrace`'s CLI doesn't expose CPU Counters' Mode dropdown, so to use
-non-default sampling you have to build a `.tracetemplate` once in
-Instruments.app and check it in. To add a new one (say, for branch
-mispredict sampling):
+In color:
 
-1. Open Instruments → New Document → Blank
-2. Add the **CPU Counters** instrument
-3. Set Configuration: **Manual**, Sample By: **Events**, pick the
-   Sampling Event (e.g. `BRANCH_MISPRED_NONSPEC`), pick Sample Every
-   (start at 1M; lower if samples are too sparse)
-4. Add a **Time Profiler** instrument with **High Frequency Sampling**
-   on, so PMI samples can be joined by timestamp to a PC
-5. File → Save as Template, into `templates/`
+![L1D miss interleaved view](img/l1d_miss.png)
 
-Then `xct2cli record -t templates/your-template.tracetemplate -o ...`
-and `xct2cli events <trace>` will show whatever event name Apple
-recorded. `--event NAME` works the same way as for the bundled
+In this trace, 931 of 2124 L1D load misses (44%) come from a single
+`prev[c_rel]` read in `find_best_match` at `match_finder.rs:278` — the
+hash-chain walk that the compiler inlined into `MatchFinder::process`.
+
+## Adding new templates
+
+`xctrace`'s CLI doesn't expose CPU Counters' Mode dropdown, so any new
+sampling mode (e.g. branch-mispredict, store-buffer-stall) needs a
+`.tracetemplate` built once in Instruments.app:
+
+1. New Document → Blank → add **CPU Counters** instrument.
+2. Configuration **Manual**, Sample By **Events**, pick the Sampling
+   Event, set Sample Every (start at 1M; lower if samples are sparse).
+3. Add a **Time Profiler** instrument with **High Frequency Sampling**
+   on so PMI samples can be joined to a PC.
+4. File → Save as Template → put it in `templates/`.
+
+`xct2cli events <trace>` will show whatever event name Apple wrote
+into the trace; `--event NAME` works the same as for the bundled
 templates.
 
 ## Library use
@@ -181,31 +195,18 @@ templates.
 ```rust
 use xct2cli::trace::TraceBundle;
 use xct2cli::analysis::HotspotsBuilder;
+use xct2cli::render::Palette;
 
 let bundle = TraceBundle::open("run.trace")?;
 let report = HotspotsBuilder::new(&bundle)
     .top(50)
     .binary(Some("target/release/myapp".into()))
     .run()?;
-println!("{}", report.to_text(Default::default()));
+println!("{}", report.to_text(Palette::new(false)));
 ```
 
 Most data-extraction helpers are inherent methods on `TraceBundle`:
 `pc_samples`, `pmi_samples`, `pmi_event_names`, `metric_labels`,
 `per_pc_pmi_count`, `per_pc_metric_deltas`, `image_loads`,
-`counters_profile_event`. `BinaryInfo::open(path)` parses Mach-O for
-slide detection (`info.slide_from(&loads)`).
-
-The streaming XML reader is exposed as `xct2cli::xml::RowReader` for
-callers that need to consume custom tables not yet covered by an
-analysis module.
-
-## What's not (yet) supported
-
-- Templates other than Time Profiler / CPU Counters haven't been
-  exercised end-to-end. The TOC reader works on any trace; the
-  analyses assume the time-sample / kdebug-counters schemas Apple
-  ships with Time Profiler / CPU Counters.
-- Multi-run traces (`xctrace record --append-run`) are partially
-  parsed (`Toc::runs` is a `Vec`) but the analysis builders only
-  consume run #1.
+`counters_profile_event`. `BinaryInfo::open(path)` parses Mach-O and
+exposes `slide_from(&loads)` for ASLR-slide detection.
