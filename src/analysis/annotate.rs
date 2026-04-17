@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use capstone::Capstone;
 use capstone::arch::BuildsCapstone;
+use capstone::arch::DetailsArchInsn;
+use capstone::arch::arm64::Arm64OperandType;
 use object::Object;
 use object::ObjectSection;
 use object::ObjectSegment;
@@ -24,23 +26,20 @@ use crate::symbol::Symbolicator;
 use crate::symbol::SymbolicatorOptions;
 use crate::trace::TraceBundle;
 
-/// What the per-instruction `samples` field on each `AnnotatedInstruction`
-/// should represent. Mutually exclusive by construction (vs the prior
-/// `Option<usize>` + `Option<String>` combo where `Some + Some` was
-/// representable but invalid).
+/// What the per-instruction `samples` field represents. Variants are
+/// mutually exclusive; this replaces a prior `(Option<usize>, Option<String>)`
+/// shape where `Some + Some` was representable but invalid.
 #[derive(Debug, Clone, Default)]
 pub enum Weight {
-    /// Raw sample counts from `time-sample` (the default; works on any
-    /// trace with a Time Profiler instrument).
+    /// Time-sample counts. Works on any trace with Time Profiler.
     #[default]
     Samples,
-    /// Per-PC delta sum of the counter at this index in the trace's
-    /// `MetricTable` / `kdebug-counters-with-time-sample`. Requires a
-    /// CPU Counters trace.
+    /// Per-CPU delta sum of `MetricTable[index]`. Requires a CPU
+    /// Counters trace.
     Metric { index: usize },
-    /// Per-PC PMI-overflow sample counts for the given event name
-    /// (e.g. `"l1d_load_miss"`, `"PL2_CACHE_MISS_LD"`). Requires a
-    /// CPU Counters trace recorded in a sampling mode.
+    /// PMI-overflow sample count for the given event (e.g.
+    /// `l1d_load_miss`, `PL2_CACHE_MISS_LD`). Requires a CPU Counters
+    /// trace recorded in a sampling mode.
     PmiEvent { name: String },
 }
 
@@ -54,8 +53,7 @@ pub struct AnnotatedFunction {
     pub file_end: FilePc,
     pub binary: PathBuf,
     pub total_samples: u64,
-    /// What the per-instruction `samples` field actually represents
-    /// (e.g. `"samples"` or `"l1d_load_miss samples"`).
+    /// Human-readable name for what `samples` counts.
     pub weight_label: String,
     pub instructions: Vec<AnnotatedInstruction>,
 }
@@ -68,16 +66,24 @@ pub struct AnnotatedInstruction {
     pub mnemonic: String,
     pub operands: String,
     pub samples: u64,
-    /// Innermost source location: where the compiler says this
-    /// instruction's code actually came from (after inlining).
+    /// Innermost (deepest-inlined) source location.
     pub file: Option<String>,
     pub line: Option<u32>,
     pub column: Option<u32>,
-    /// Innermost function name (possibly an inlined function).
+    /// Innermost function name; may be inlined.
     pub function: Option<String>,
-    /// Outer call sites that inlined this code, closest-out first. Empty
-    /// when not inlined.
+    /// Outer call sites that inlined this code, closest-out first.
     pub inlined_into: Vec<InlinedFrame>,
+    /// PC of a recent load whose write feeds a register this instruction
+    /// reads. Heuristic — Apple Silicon OoO can stall on a different load
+    /// than the most-recent producer, but for memory-bound code this is
+    /// usually the right one. Explains why ALU ops show hot when the
+    /// actual miss is two instructions upstream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stalled_on: Option<RuntimePc>,
+    /// Resolved branch target, when within this function.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_target_loc: Option<(String, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,15 +159,43 @@ pub fn annotate(bundle: &TraceBundle, opts: AnnotateOptions) -> Result<Annotated
     let cs = Capstone::new()
         .arm64()
         .mode(capstone::arch::arm64::ArchMode::Arm)
+        .detail(true)
         .build()
         .map_err(|e| Error::Addr2Line(format!("capstone init: {e}")))?;
     let insns = cs
         .disasm_all(func_bytes, sym.file_addr.raw())
         .map_err(|e| Error::Addr2Line(format!("disassemble: {e}")))?;
 
+    let mut reads: Vec<Vec<u16>> = Vec::with_capacity(insns.len());
+    let mut writes: Vec<Vec<u16>> = Vec::with_capacity(insns.len());
+    let mut branch_targets: Vec<Option<RuntimePc>> = Vec::with_capacity(insns.len());
+
     let mut instructions: Vec<AnnotatedInstruction> = Vec::with_capacity(insns.len());
     let mut total_samples: u64 = 0;
+
     for ins in insns.iter() {
+        let detail = cs.insn_detail(ins).ok();
+        let (rs, ws) = detail
+            .as_ref()
+            .map(|d| {
+                (
+                    d.regs_read().iter().map(|r| r.0).collect::<Vec<_>>(),
+                    d.regs_write().iter().map(|r| r.0).collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
+        reads.push(rs);
+        writes.push(ws);
+        let mnemonic = ins.mnemonic().unwrap_or("").to_string();
+        let target = if is_branch(&mnemonic) {
+            detail
+                .as_ref()
+                .and_then(|d| extract_branch_target(d, slide))
+        } else {
+            None
+        };
+        branch_targets.push(target);
+
         let file_addr = FilePc::new(ins.address());
         let runtime_addr = file_addr.to_runtime(slide);
         let frame = symbolicator.resolve(runtime_addr).ok();
@@ -171,7 +205,7 @@ pub fn annotate(bundle: &TraceBundle, opts: AnnotateOptions) -> Result<Annotated
             runtime_address: runtime_addr,
             file_address: file_addr,
             bytes: ins.bytes().to_vec(),
-            mnemonic: ins.mnemonic().unwrap_or("").to_string(),
+            mnemonic,
             operands: ins.op_str().unwrap_or("").to_string(),
             samples,
             file: frame.as_ref().and_then(|f| f.file.clone()),
@@ -182,7 +216,46 @@ pub fn annotate(bundle: &TraceBundle, opts: AnnotateOptions) -> Result<Annotated
                 .as_ref()
                 .map(|f| f.inlined_into.clone())
                 .unwrap_or_default(),
+            stalled_on: None,
+            branch_target_loc: None,
         });
+    }
+
+    // ARM64 OoO cores can have many in-flight uops; 8 is a coarse but
+    // useful "recently produced" window. Larger and we tag too many
+    // unrelated dependencies; smaller and we miss real stalls.
+    const STALL_WINDOW: usize = 8;
+    for i in 0..instructions.len() {
+        if is_load(&instructions[i].mnemonic) {
+            continue;
+        }
+        if reads[i].is_empty() {
+            continue;
+        }
+        let lo = i.saturating_sub(STALL_WINDOW);
+        for j in (lo..i).rev() {
+            if !is_load(&instructions[j].mnemonic) {
+                continue;
+            }
+            if writes[j].iter().any(|w| reads[i].contains(w)) {
+                instructions[i].stalled_on = Some(instructions[j].runtime_address);
+                break;
+            }
+        }
+    }
+
+    let mut pc_to_loc: HashMap<RuntimePc, (String, u32)> = HashMap::new();
+    for ins in &instructions {
+        if let (Some(f), Some(l)) = (&ins.file, ins.line) {
+            pc_to_loc.insert(ins.runtime_address, (f.clone(), l));
+        }
+    }
+    for (i, ins) in instructions.iter_mut().enumerate() {
+        if let Some(target) = branch_targets[i]
+            && let Some(loc) = pc_to_loc.get(&target)
+        {
+            ins.branch_target_loc = Some(loc.clone());
+        }
     }
 
     Ok(AnnotatedFunction {
@@ -293,6 +366,35 @@ fn find_function<'a>(macho: &'a object::File<'a>, needle: &str) -> Result<FoundS
         raw_name: raw.to_string(),
         demangled: dem,
     })
+}
+
+/// Prefix match catches the whole `ld`-family (ldr/ldp/ldur/ldrb/...).
+fn is_load(mnemonic: &str) -> bool {
+    mnemonic.starts_with("ld")
+}
+
+fn is_branch(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "b" | "bl" | "br" | "blr" | "cbz" | "cbnz" | "tbz" | "tbnz" | "ret"
+    ) || mnemonic.starts_with("b.")
+}
+
+/// Returns `None` for register-indirect branches (`br`, `blr`, `ret`).
+fn extract_branch_target(
+    detail: &capstone::InsnDetail<'_>,
+    slide: crate::address::Slide,
+) -> Option<RuntimePc> {
+    let arch = detail.arch_detail();
+    let arm64 = arch.arm64()?;
+    for op in arm64.operands() {
+        if let Arm64OperandType::Imm(addr) = op.op_type
+            && addr >= 0
+        {
+            return Some(FilePc::new(addr as u64).to_runtime(slide));
+        }
+    }
+    None
 }
 
 fn demangle_name(s: &str) -> String {

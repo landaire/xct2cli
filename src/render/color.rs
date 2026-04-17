@@ -1,8 +1,6 @@
-//! Heat palette + color-mode resolution.
-//!
-//! Single hot/cool ramp keyed off `intensity = value / max_in_section`.
-//! When `colored = false` every helper returns the empty `Style`, so call
-//! sites can `palette.X().style(text)` unconditionally.
+//! Heat palette + color-mode resolution. Helpers return an empty
+//! `Style` when `colored = false`, so call sites can use them
+//! unconditionally.
 
 use std::io::IsTerminal;
 
@@ -17,7 +15,7 @@ pub enum ColorMode {
 }
 
 impl ColorMode {
-    /// Resolve to a concrete on/off, honoring `NO_COLOR` and `IsTerminal`.
+    /// Honors `NO_COLOR` and stdout's `IsTerminal`.
     pub fn resolve(self) -> bool {
         match self {
             Self::Always => true,
@@ -42,7 +40,7 @@ impl Palette {
         Self { colored }
     }
 
-    /// Heat ramp for `intensity` in `[0.0, 1.0]`. Higher = hotter.
+    /// Heat ramp for `intensity` in `[0.0, 1.0]`. Higher is hotter.
     pub fn heat(self, intensity: f64) -> Style {
         if !self.colored {
             return Style::new();
@@ -74,7 +72,6 @@ impl Palette {
         Style::new().bold()
     }
 
-    /// Function names.
     pub fn function(self) -> Style {
         if !self.colored {
             return Style::new();
@@ -82,7 +79,6 @@ impl Palette {
         Style::new().cyan()
     }
 
-    /// File paths and `file:line` locations.
     pub fn path(self) -> Style {
         if !self.colored {
             return Style::new();
@@ -90,7 +86,6 @@ impl Palette {
         Style::new().bright_black()
     }
 
-    /// Section / table headers.
     pub fn header(self) -> Style {
         if !self.colored {
             return Style::new();
@@ -98,26 +93,25 @@ impl Palette {
         Style::new().bold().underline()
     }
 
-    /// Cycling palette for marking hot source lines so the same line in
-    /// the asm overlay and in the source snippet share a color. Hues
-    /// spaced ~36° apart (skipping pure red — that's the heat ramp).
-    /// Uses truecolor; terminals that lack it fall back via owo-colors
-    /// to the nearest 256-color match.
+    /// Stable color per hot-line index so the same line gets the same
+    /// color in the asm overlay and the source snippet. Skips red (heat
+    /// owns it) and grey (dim/path owns it). Truecolor; owo-colors
+    /// falls back to nearest 256-color when needed.
     pub fn line_marker(self, index: usize) -> Style {
         if !self.colored {
             return Style::new();
         }
         const PALETTE: &[(u8, u8, u8)] = &[
-            (0x4d, 0xb8, 0xff), // sky blue
-            (0xff, 0x6b, 0x9d), // pink
-            (0xa3, 0xe6, 0x35), // lime
-            (0xff, 0xa6, 0x4d), // orange
-            (0xc2, 0x9b, 0xff), // purple
-            (0x6b, 0xff, 0xea), // teal
-            (0xff, 0xd7, 0x00), // gold
-            (0x4d, 0xe6, 0xa6), // spring green
-            (0xe6, 0x5b, 0xb7), // magenta
-            (0x6b, 0x5b, 0xe6), // indigo
+            (0x4d, 0xb8, 0xff),
+            (0xff, 0x6b, 0x9d),
+            (0xa3, 0xe6, 0x35),
+            (0xff, 0xa6, 0x4d),
+            (0xc2, 0x9b, 0xff),
+            (0x6b, 0xff, 0xea),
+            (0xff, 0xd7, 0x00),
+            (0x4d, 0xe6, 0xa6),
+            (0xe6, 0x5b, 0xb7),
+            (0x6b, 0x5b, 0xe6),
         ];
         let (r, g, b) = PALETTE[index % PALETTE.len()];
         Style::new().truecolor(r, g, b).bold()

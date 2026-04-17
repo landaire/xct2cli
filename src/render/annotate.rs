@@ -29,14 +29,12 @@ pub struct AnnotateRenderOptions {
     pub source_root: Option<PathBuf>,
     pub mode: AnnotateMode,
     pub colored: bool,
-    /// Lines of source context shown above/below each hot-line cluster
-    /// in the source-snippet view. Hot lines within `2 * context` lines
-    /// of each other share one snippet; further apart, they split.
+    /// Source-snippet context. Hot lines within `2 * context` of each
+    /// other share one snippet; further apart, they split.
     pub context: u32,
 }
 
 impl AnnotatedFunction {
-    /// Render the disassembly + source overlay according to `opts`.
     pub fn render(&self, opts: &AnnotateRenderOptions) -> Result<String> {
         match opts.mode {
             AnnotateMode::Instructions => render_instructions(self, opts),
@@ -51,6 +49,7 @@ fn render_instructions(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -
     write_header(&mut out, func, opts);
     let pal = Palette::new(opts.colored);
     let hot_colors = build_hot_line_colors(func, pal);
+    let producer_colors = build_producer_colors(func, pal, opts.show_zero);
 
     let max_samples = func
         .instructions
@@ -58,10 +57,17 @@ fn render_instructions(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -
         .map(|i| i.samples)
         .max()
         .unwrap_or(0);
+    let mut prev_pc: Option<crate::address::RuntimePc> = None;
     for ins in &func.instructions {
         if ins.samples == 0 && !opts.show_zero {
             continue;
         }
+        if let Some(prev) = prev_pc
+            && ins.runtime_address.raw() != prev.raw() + 4
+        {
+            let _ = writeln!(out, "  {}", pal.dim().style("..."));
+        }
+        prev_pc = Some(ins.runtime_address);
         let intensity = intensity(ins.samples, max_samples);
         let bar = bar_str(ins.samples, max_samples);
         let loc = match (&ins.file, ins.line) {
@@ -80,16 +86,23 @@ fn render_instructions(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -
             }
             _ => String::new(),
         };
+        let extra = annotation_suffix(ins, &pal, &producer_colors);
         let heat = pal.heat(intensity);
+        let pc_str = format!("0x{:012x}", ins.runtime_address.raw());
+        let pc_styled = match producer_colors.get(&ins.runtime_address) {
+            Some(style) => format!("{}", style.style(pc_str)),
+            None => pc_str,
+        };
         let _ = writeln!(
             out,
-            "  {}  {}  0x{:012x}  {} {}{}",
+            "  {}  {}  {}  {} {}{}{}",
             heat.style(format!("{:>5}", ins.samples)),
             heat.style(format!("{:<10}", bar)),
-            ins.runtime_address.raw(),
+            pc_styled,
             ins.mnemonic,
             ins.operands,
             loc,
+            extra,
         );
     }
 
@@ -116,6 +129,7 @@ fn render_interleaved(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) ->
     let mut out = String::new();
     write_header(&mut out, func, opts);
     let pal = Palette::new(opts.colored);
+    let producer_colors = build_producer_colors(func, pal, opts.show_zero);
 
     let max_samples = func
         .instructions
@@ -140,7 +154,6 @@ fn render_interleaved(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) ->
         ));
         let inlined_label = group_inlined_label(&group);
 
-        // Header line: stats + identity + (optional inlining note).
         match (&group.file, group.line) {
             (Some(f), Some(l)) => {
                 let loc = pal.path().style(format!("{}:{}", short_path(f), l));
@@ -168,7 +181,6 @@ fn render_interleaved(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) ->
             }
         }
 
-        // Source code on its own indented line, trimmed.
         if let (Some(f), Some(l)) = (&group.file, group.line) {
             let text = source_cache
                 .entry(f.clone())
@@ -178,22 +190,35 @@ fn render_interleaved(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) ->
             }
         }
 
-        // Instructions, indented further.
+        let mut prev_pc: Option<crate::address::RuntimePc> = None;
         for ins in group.instructions {
             if ins.samples == 0 && !opts.show_zero {
                 continue;
             }
+            if let Some(prev) = prev_pc
+                && ins.runtime_address.raw() != prev.raw() + 4
+            {
+                let _ = writeln!(out, "        {}", pal.dim().style("..."));
+            }
+            prev_pc = Some(ins.runtime_address);
             let intensity = intensity(ins.samples, max_samples);
             let bar = bar_str(ins.samples, max_samples);
             let heat = pal.heat(intensity);
+            let extra = annotation_suffix(ins, &pal, &producer_colors);
+            let pc_str = format!("0x{:012x}", ins.runtime_address.raw());
+            let pc_styled = match producer_colors.get(&ins.runtime_address) {
+                Some(style) => format!("{}", style.style(pc_str)),
+                None => pc_str,
+            };
             let _ = writeln!(
                 out,
-                "        {}  {}  0x{:012x}  {} {}",
+                "        {}  {}  {}  {} {}{}",
                 heat.style(format!("{:>5}", ins.samples)),
                 heat.style(format!("{:<10}", bar)),
-                ins.runtime_address.raw(),
+                pc_styled,
                 ins.mnemonic,
-                ins.operands
+                ins.operands,
+                extra,
             );
         }
         let _ = writeln!(out);
@@ -226,6 +251,58 @@ fn write_header(out: &mut String, func: &AnnotatedFunction, opts: &AnnotateRende
         pal.dim()
             .style(format!("0x{:x}..0x{:x}", func.file_start, func.file_end)),
     );
+}
+
+fn annotation_suffix(
+    ins: &crate::analysis::AnnotatedInstruction,
+    pal: &Palette,
+    producer_colors: &HashMap<crate::address::RuntimePc, Style>,
+) -> String {
+    let mut out = String::new();
+    if let Some(target_pc) = ins.stalled_on {
+        let pc_text = format!("0x{:x}", target_pc.raw());
+        let pc_styled = match producer_colors.get(&target_pc) {
+            Some(style) => format!("{}", style.style(pc_text)),
+            None => pc_text,
+        };
+        out.push_str("  ");
+        out.push_str(&format!("{}", pal.dim().style("[stalled on @ ")));
+        out.push_str(&pc_styled);
+        out.push_str(&format!("{}", pal.dim().style("]")));
+    }
+    if let Some((file, line)) = &ins.branch_target_loc {
+        out.push_str("  ");
+        out.push_str(&format!(
+            "{}",
+            pal.dim()
+                .style(format!("[→ {}:{}]", super::annotate::short_path(file), line))
+        ));
+    }
+    out
+}
+
+/// Color map for stall-producer PCs: any load referenced by a
+/// *visible* consumer's `stalled_on`. Filtering by visibility avoids
+/// painting a producer whose only reference was a hidden 0-sample
+/// instruction (yields an orphaned colored address with no matching
+/// `[stalled on @ ...]` annotation anywhere on screen).
+fn build_producer_colors(
+    func: &AnnotatedFunction,
+    pal: Palette,
+    show_zero: bool,
+) -> HashMap<crate::address::RuntimePc, Style> {
+    use std::collections::BTreeSet;
+    let producers: BTreeSet<crate::address::RuntimePc> = func
+        .instructions
+        .iter()
+        .filter(|i| show_zero || i.samples > 0)
+        .filter_map(|i| i.stalled_on)
+        .collect();
+    producers
+        .into_iter()
+        .enumerate()
+        .map(|(idx, pc)| (pc, pal.line_marker(idx)))
+        .collect()
 }
 
 fn intensity(value: u64, max: u64) -> f64 {
@@ -301,15 +378,13 @@ fn write_source_blocks(
             let group =
                 Group::with_title(Level::NOTE.primary_title(string_static(&title))).element(snippet);
             let _ = writeln!(out, "{}", renderer.render(&[group]));
+            let _ = writeln!(out);
         }
     }
 }
 
-/// Assign a stable color from `Palette::line_marker` to every hot source
-/// line in the function. Iterates files in the order returned by
-/// `group_by_source` (alphabetical by file path) and lines ascending,
-/// so the asm overlay and the source snippet always agree on which
-/// color belongs to which line.
+/// Stable (file, line) -> color map shared by the asm overlay and the
+/// source snippet so identical lines render in the same color in both.
 fn build_hot_line_colors(
     func: &AnnotatedFunction,
     pal: Palette,
@@ -328,9 +403,9 @@ fn build_hot_line_colors(
     out
 }
 
-/// Group sorted-by-line hot entries into runs that are within `max_gap`
-/// of each other. Each cluster gets its own source snippet so distant
-/// hot lines don't drag hundreds of unrelated lines into one block.
+/// Splits hot lines into clusters separated by gaps > `max_gap`. Without
+/// this a function with hot lines at e.g. line 38 and line 278 would
+/// dump 240 lines of unrelated source into one snippet.
 fn cluster_hot_lines(lines: &[(u32, u64)], max_gap: u32) -> Vec<Vec<(u32, u64)>> {
     let mut sorted = lines.to_vec();
     sorted.sort_by_key(|(l, _)| *l);
@@ -346,10 +421,9 @@ fn cluster_hot_lines(lines: &[(u32, u64)], max_gap: u32) -> Vec<Vec<(u32, u64)>>
     clusters
 }
 
-/// Strip the leading whitespace of the first non-empty line from every
-/// subsequent line, preserving sub-block indentation. Lines whose own
-/// leading whitespace is shorter than the first line's are left
-/// untouched (defensive — shouldn't happen in normal Rust source).
+/// Strips the first non-empty line's leading whitespace uniformly from
+/// every line, so deeply-indented Rust code starts at column 0 while
+/// inner blocks keep their relative indent.
 fn dedent_block(text: &str) -> String {
     let indent = text
         .lines()
@@ -409,10 +483,8 @@ fn group_consecutive_by_source(
     out
 }
 
-/// Returns a one-liner like `inlined into MatchFinder::process at process:182`
-/// when the instructions in this group come from inlined code, else `None`.
-/// Uses the *innermost outer* call site (the function that directly inlined
-/// us), since that's the most useful "where this came from" hint.
+/// Builds the `inlined into <fn> at <file>:<line>` suffix using the
+/// innermost outer call site (most useful "where this came from").
 fn group_inlined_label(group: &InstructionGroup<'_>) -> Option<String> {
     let first = group.instructions.first()?;
     let outer = first.inlined_into.first()?;
