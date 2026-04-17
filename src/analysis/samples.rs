@@ -83,11 +83,15 @@ impl TraceBundle {
     /// rows only). One `Callstack` per row; identical stacks are NOT
     /// deduped — the caller can aggregate as needed.
     pub fn callstacks(&self, pid: Option<Pid>) -> Result<Vec<Callstack>> {
-        let xml = self.xctrace().export_xpath(self.path(), TIME_SAMPLE_XPATH)?;
+        let xml = self
+            .xctrace()
+            .export_xpath(self.path(), TIME_SAMPLE_XPATH)?;
         let mut reader = RowReader::new(std::io::Cursor::new(xml));
         let mut out: Vec<Callstack> = Vec::new();
         while let Some(ev) = reader.next_event()? {
-            let RowReaderEvent::Row(cells) = ev else { continue };
+            let RowReaderEvent::Row(cells) = ev else {
+                continue;
+            };
             let mut sample_pid: i64 = -1;
             let mut state: Option<&str> = None;
             let mut user_bt: Option<&Rc<Cell>> = None;
@@ -123,7 +127,9 @@ impl TraceBundle {
                 continue;
             }
             let Some(bt) = user_bt else { continue };
-            let Some(frames) = extract_frames(bt) else { continue };
+            let Some(frames) = extract_frames(bt) else {
+                continue;
+            };
             if frames.is_empty() {
                 continue;
             }

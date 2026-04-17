@@ -274,8 +274,11 @@ fn annotation_suffix(
         out.push_str("  ");
         out.push_str(&format!(
             "{}",
-            pal.dim()
-                .style(format!("[→ {}:{}]", super::annotate::short_path(file), line))
+            pal.dim().style(format!(
+                "[→ {}:{}]",
+                super::annotate::short_path(file),
+                line
+            ))
         ));
     }
     out
@@ -356,8 +359,7 @@ fn write_source_blocks(
                 .line_start(display_start as usize)
                 .fold(false);
             for (line, samples) in &cluster {
-                let Some(span) = line_byte_range(display_text_static, *line, display_start)
-                else {
+                let Some(span) = line_byte_range(display_text_static, *line, display_start) else {
                     continue;
                 };
                 let marker = hot_colors.get(&(file.clone(), *line)).copied();
@@ -375,8 +377,8 @@ fn write_source_blocks(
             }
 
             let title = format!("hot lines in {}", short_path(&file));
-            let group =
-                Group::with_title(Level::NOTE.primary_title(string_static(&title))).element(snippet);
+            let group = Group::with_title(Level::NOTE.primary_title(string_static(&title)))
+                .element(snippet);
             let _ = writeln!(out, "{}", renderer.render(&[group]));
             let _ = writeln!(out);
         }
@@ -385,10 +387,7 @@ fn write_source_blocks(
 
 /// Stable (file, line) -> color map shared by the asm overlay and the
 /// source snippet so identical lines render in the same color in both.
-fn build_hot_line_colors(
-    func: &AnnotatedFunction,
-    pal: Palette,
-) -> HashMap<(String, u32), Style> {
+fn build_hot_line_colors(func: &AnnotatedFunction, pal: Palette) -> HashMap<(String, u32), Style> {
     let mut out: HashMap<(String, u32), Style> = HashMap::new();
     let mut idx = 0usize;
     for (file, lines) in group_by_source(func) {
@@ -467,9 +466,7 @@ fn group_consecutive_by_source(
     for ins in insns {
         let key = (ins.file.clone(), ins.line, ins.function.clone());
         match out.last_mut() {
-            Some(last)
-                if (last.file.clone(), last.line, last.function.clone()) == key =>
-            {
+            Some(last) if (last.file.clone(), last.line, last.function.clone()) == key => {
                 last.instructions.push(ins);
             }
             _ => out.push(InstructionGroup {

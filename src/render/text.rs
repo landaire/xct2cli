@@ -249,7 +249,9 @@ impl CallgraphReport {
             let _ = writeln!(
                 out,
                 "  {}  {:>5.1}%  {}",
-                palette.heat(intensity).style(format!("{:>7}", stat.samples)),
+                palette
+                    .heat(intensity)
+                    .style(format!("{:>7}", stat.samples)),
                 pct,
                 palette.function().style(&stat.function),
             );
