@@ -197,12 +197,6 @@ struct AnnotateArgs {
     /// of each other share one snippet.
     #[arg(long, default_value_t = 4)]
     context: u32,
-    /// Heat-bar scale. `function` (default) normalises to the hottest
-    /// instruction in the function being annotated. `trace` normalises
-    /// to the hottest single PC anywhere in the trace, so bars are
-    /// comparable across `annotate` runs on different functions.
-    #[arg(long, value_enum, default_value_t = CliBarScale::Function)]
-    bar_scale: CliBarScale,
     /// Overlay a CPU-Counters metric (per-PC delta sum) instead of raw
     /// sample counts. The index matches the `[N] <name>` legend printed
     /// by `xct2cli events`. Requires a CPU Counters trace.
@@ -234,12 +228,6 @@ enum CliAnnotateMode {
     Instructions,
     Source,
     Interleaved,
-}
-
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-enum CliBarScale {
-    Function,
-    Trace,
 }
 
 impl From<CliAnnotateMode> for AnnotateMode {
@@ -501,47 +489,22 @@ fn run_annotate(args: AnnotateArgs, palette: Palette) -> anyhow::Result<()> {
         pid: args.pid.map(Pid::new),
         weight: args.weight(),
     };
-    let weight_for_max = args.weight();
     let func = annotate(&bundle, opts).context("annotating function")?;
     if args.json {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &func)?;
         println!();
     } else {
-        let bar_scale_max = match args.bar_scale {
-            CliBarScale::Function => None,
-            CliBarScale::Trace => {
-                Some(trace_wide_max(&bundle, &weight_for_max, args.pid.map(Pid::new)).unwrap_or(0))
-            }
-        };
         let render_opts = AnnotateRenderOptions {
             show_zero: args.show_zero,
             source_root: args.source_root,
             mode: args.mode.into(),
             colored: palette.colored,
             context: args.context,
-            bar_scale_max,
         };
         let text = func.render(&render_opts)?;
         print!("{}", text);
     }
     Ok(())
-}
-
-fn trace_wide_max(bundle: &TraceBundle, weight: &Weight, pid: Option<Pid>) -> Option<u64> {
-    match weight {
-        Weight::Samples => bundle
-            .pc_samples(pid)
-            .ok()
-            .and_then(|v| v.into_iter().map(|s| s.samples).max()),
-        Weight::Metric { index } => bundle
-            .per_pc_metric_deltas(pid, *index)
-            .ok()
-            .and_then(|m| m.into_values().max()),
-        Weight::PmiEvent { name } => bundle
-            .per_pc_pmi_count(pid, name)
-            .ok()
-            .and_then(|m| m.into_values().max()),
-    }
 }
 
 fn run_slide(args: SlideArgs) -> anyhow::Result<()> {

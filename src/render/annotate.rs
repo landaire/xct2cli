@@ -32,11 +32,6 @@ pub struct AnnotateRenderOptions {
     /// Source-snippet context. Hot lines within `2 * context` of each
     /// other share one snippet; further apart, they split.
     pub context: u32,
-    /// When `Some`, use this value as the bar-scale denominator instead
-    /// of the function-local max. Pass the trace-wide max for the
-    /// chosen weight so bars are comparable across `annotate` runs on
-    /// different functions in the same trace.
-    pub bar_scale_max: Option<u64>,
 }
 
 impl AnnotatedFunction {
@@ -56,13 +51,12 @@ fn render_instructions(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) -
     let hot_colors = build_hot_line_colors(func, pal);
     let producer_colors = build_producer_colors(func, pal, opts.show_zero);
 
-    let max_samples = opts.bar_scale_max.unwrap_or_else(|| {
-        func.instructions
-            .iter()
-            .map(|i| i.samples)
-            .max()
-            .unwrap_or(0)
-    });
+    let max_samples = func
+        .instructions
+        .iter()
+        .map(|i| i.samples)
+        .max()
+        .unwrap_or(0);
     let mut prev_pc: Option<crate::address::RuntimePc> = None;
     for ins in &func.instructions {
         if ins.samples == 0 && !opts.show_zero {
@@ -137,13 +131,12 @@ fn render_interleaved(func: &AnnotatedFunction, opts: &AnnotateRenderOptions) ->
     let pal = Palette::new(opts.colored);
     let producer_colors = build_producer_colors(func, pal, opts.show_zero);
 
-    let max_samples = opts.bar_scale_max.unwrap_or_else(|| {
-        func.instructions
-            .iter()
-            .map(|i| i.samples)
-            .max()
-            .unwrap_or(0)
-    });
+    let max_samples = func
+        .instructions
+        .iter()
+        .map(|i| i.samples)
+        .max()
+        .unwrap_or(0);
     let mut source_cache: BTreeMap<String, Option<String>> = BTreeMap::new();
 
     let groups = group_consecutive_by_source(&func.instructions);

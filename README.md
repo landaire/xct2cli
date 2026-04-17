@@ -23,28 +23,35 @@ time.
 
 ```
 xct2cli toc       <trace>                          # what's in the bundle
-xct2cli hotspots  <trace> [--binary BIN] [--dsym DSYM]
+xct2cli hotspots  <trace> [--binary BIN] [--dsym DSYM] [--filter SUBSTR]
 xct2cli slide     <trace> [--binary BIN] [--dsym DSYM]
 xct2cli annotate  <trace> --function NAME [--mode interleaved] [--event NAME | --metric N]
 xct2cli callgraph <trace> [--function NAME] [--top 10]
 xct2cli counters  <trace> [--sort-by N]
 xct2cli events    <trace>                          # list metric / pmi-event names
-xct2cli record    -t TEMPLATE -o OUT.trace -- ./bin args
+xct2cli record    -t TEMPLATE -o OUT.trace [-f] -- ./bin args
 ```
 
 Global flags: `--color {auto,always,never}` (auto-detect TTY + honor
 `NO_COLOR`), `--verbose`, `--json` on every command for
-machine-readable output. ASLR slide is recovered automatically from the
-trace's kdebug image-load events whenever `--binary` or `--dsym` is
-provided; `xct2cli slide` is the escape hatch when that fails.
+machine-readable output. ASLR slide is recovered automatically from
+the trace's kdebug image-load events whenever `--binary` is provided;
+`xct2cli slide` is the escape hatch when that fails. `<binary>.dSYM`
+next to the binary is picked up automatically — pass `--dsym` only for
+non-standard layouts.
 
 ## Time profile (Time Profiler trace)
 
+### Record and inspect the bundle
+
 ```sh
-xct2cli record -t "Time Profiler" -o /tmp/run.trace -- \
+xct2cli record -f -t "Time Profiler" -o /tmp/run.trace -- \
     target/release/examples/profile_compress
 xct2cli toc /tmp/run.trace
 ```
+
+`-f`/`--force` removes an existing bundle at `--output` first; `xctrace`
+itself errors if the bundle already exists.
 
 ```
 run #1
@@ -62,6 +69,8 @@ run #1
     kdebug
     ...
 ```
+
+### Hotspots: per-CPU summary + top PCs
 
 ```sh
 xct2cli hotspots /tmp/run.trace
@@ -92,9 +101,20 @@ top 25 PCs:
        ...
 ```
 
-For a flamegraph-style top-down view, use `callgraph`. Inclusive
-samples (function appears anywhere in the stack — bar width in a
-flamegraph):
+### Filter out stdlib / system noise
+
+`--filter SUBSTR` keeps only PCs whose resolved function name contains
+`SUBSTR` (case-insensitive), applied after symbolication and before
+`--top` truncation:
+
+```sh
+xct2cli hotspots /tmp/run.trace --filter lzxc:: --top 5
+```
+
+### Callgraph: flamegraph-style top-down view
+
+Inclusive samples (function appears anywhere in the stack — bar width
+in a flamegraph):
 
 ```sh
 xct2cli callgraph /tmp/run.trace
@@ -113,12 +133,14 @@ top functions (inclusive)  (499 samples)
         9    1.8%  lzxc::huffman::build_path_lengths
 ```
 
-Drill into a hot function to see what it was calling at sample time
-(its stack-frame children):
+### Drill into a hot function's callees
 
 ```sh
 xct2cli callgraph /tmp/run.trace --function encode_chunk
 ```
+
+Shows what `encode_chunk` was calling at sample time (its stack-frame
+children):
 
 ```
 callees of encode_chunk  (495 samples)
@@ -127,6 +149,8 @@ callees of encode_chunk  (495 samples)
       128   25.9%  lzxc::verbatim::emit_verbatim_block
         3    0.6%  0x182ea9418
 ```
+
+### Annotate: per-instruction view with source
 
 `callgraph` works on stack-walked frames, so functions that were
 inlined into their caller are *invisible* — kperf only saw one stack
@@ -160,6 +184,8 @@ callouts.
 
 ## Per-instruction cache miss attribution (CPU Counters trace)
 
+### Picking a template
+
 For literal cache miss attribution you need a `.tracetemplate`
 configured for PMI-overflow sampling on a memory event. Two are
 checked in under `templates/`:
@@ -172,6 +198,8 @@ checked in under `templates/`:
   doesn't capture per-PMI callstacks, so PCs are recovered by joining
   each PMI sample to the nearest `time-sample` row from the
   co-recorded Time Profiler.
+
+### Record and list available events
 
 ```sh
 xct2cli record -t templates/L1D_Miss.tracetemplate -o /tmp/l1d.trace -- \
@@ -191,6 +219,8 @@ pmi events (use with `annotate --event NAME`):
   l1d_store_miss             1546   38.3%
   l1d_tlb_miss                 20    0.5%
 ```
+
+### Attribute misses to specific source lines
 
 ```sh
 xct2cli annotate /tmp/l1d.trace --function MatchFinder::process \
