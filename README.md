@@ -26,6 +26,7 @@ xct2cli toc       <trace>                          # what's in the bundle
 xct2cli hotspots  <trace> [--binary BIN] [--dsym DSYM]
 xct2cli slide     <trace> [--binary BIN] [--dsym DSYM]
 xct2cli annotate  <trace> --function NAME [--mode interleaved] [--event NAME | --metric N]
+xct2cli callgraph <trace> [--function NAME] [--top 10]
 xct2cli counters  <trace> [--sort-by N]
 xct2cli events    <trace>                          # list metric / pmi-event names
 xct2cli record    -t TEMPLATE -o OUT.trace -- ./bin args
@@ -91,7 +92,46 @@ top 25 PCs:
        ...
 ```
 
-Then drill into the hottest function:
+For a flamegraph-style top-down view, use `callgraph`. Inclusive
+samples (function appears anywhere in the stack — bar width in a
+flamegraph):
+
+```sh
+xct2cli callgraph /tmp/run.trace
+```
+
+```
+top functions (inclusive)  (499 samples)
+
+      497   99.6%  _main
+      497   99.6%  std::rt::lang_start::{{closure}}
+      497   99.6%  std::sys::backtrace::__rust_begin_short_backtrace
+      497   99.6%  profile_compress::main
+      495   99.2%  lzxc::Encoder::encode_chunk
+      359   71.9%  lzxc::match_finder::MatchFinder::process
+      128   25.7%  lzxc::verbatim::emit_verbatim_block
+        9    1.8%  lzxc::huffman::build_path_lengths
+```
+
+Drill into a hot function to see what it was calling at sample time
+(its stack-frame children):
+
+```sh
+xct2cli callgraph /tmp/run.trace --function encode_chunk
+```
+
+```
+callees of encode_chunk  (495 samples)
+
+      359   72.5%  lzxc::match_finder::MatchFinder::process
+      128   25.9%  lzxc::verbatim::emit_verbatim_block
+        3    0.6%  0x182ea9418
+```
+
+`callgraph` works on stack-walked frames, so functions that were
+inlined into their caller are *invisible* — kperf only saw one stack
+frame for the whole inline chain. To see source-level inlined callees
+of a function, use `annotate` instead:
 
 ```sh
 xct2cli annotate /tmp/run.trace --function MatchFinder::process --mode interleaved

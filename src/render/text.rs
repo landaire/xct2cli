@@ -1,5 +1,6 @@
 use std::fmt::Write;
 
+use crate::analysis::CallgraphReport;
 use crate::analysis::CounterReport;
 use crate::analysis::HotspotReport;
 use crate::render::Palette;
@@ -222,6 +223,36 @@ impl CounterReport {
                 }
             }
             let _ = writeln!(out);
+        }
+        out
+    }
+}
+
+impl CallgraphReport {
+    pub fn to_text(&self, palette: Palette) -> String {
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "{}  ({} samples)",
+            palette.header().style(&self.view),
+            self.total_samples,
+        );
+        let _ = writeln!(out);
+        let max = self.stats.iter().map(|s| s.samples).max().unwrap_or(0);
+        for stat in &self.stats {
+            let intensity = if max == 0 {
+                0.0
+            } else {
+                stat.samples as f64 / max as f64
+            };
+            let pct = stat.fraction * 100.0;
+            let _ = writeln!(
+                out,
+                "  {}  {:>5.1}%  {}",
+                palette.heat(intensity).style(format!("{:>7}", stat.samples)),
+                pct,
+                palette.function().style(&stat.function),
+            );
         }
         out
     }

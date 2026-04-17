@@ -69,6 +69,18 @@ impl Symbolicator {
         })
     }
 
+    /// The binary's symbol-table name for this PC (`addr2line::Loader::find_symbol_info`).
+    /// Unlike `resolve`, this returns the *concrete* binary function
+    /// containing the PC — not the deepest-inlined source function. Use
+    /// for stack-frame analysis where you want the real call frame.
+    pub fn symbol_at(&self, runtime_pc: RuntimePc) -> Option<String> {
+        let loader = self.loader.as_ref()?;
+        let probe = runtime_pc.to_file(self.slide)?;
+        loader
+            .find_symbol_info(probe.raw())
+            .map(|s| demangle(s.name()))
+    }
+
     pub fn resolve(&self, runtime_pc: RuntimePc) -> Result<SymbolicatedFrame> {
         let mut frame = SymbolicatedFrame {
             address: runtime_pc,

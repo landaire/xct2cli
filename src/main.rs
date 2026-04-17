@@ -12,6 +12,7 @@ use xct2cli::xctrace::Xctrace;
 use xct2cli::Pid;
 use xct2cli::Slide;
 use xct2cli::analysis::AnnotateOptions;
+use xct2cli::analysis::CallgraphBuilder;
 use xct2cli::analysis::CountersBuilder;
 use xct2cli::analysis::HotspotsBuilder;
 use xct2cli::analysis::SlideMode;
@@ -86,6 +87,32 @@ enum Command {
     /// List the metric and PMI event names in a trace, for use with
     /// `--metric` / `--event` on `annotate` and `counters`.
     Events(EventsArgs),
+
+    /// Top-N hottest functions across the whole trace (inclusive
+    /// samples, like a flamegraph bar's width). With `--function NAME`,
+    /// instead show the top callees of that function — the next-deeper
+    /// frame in stacks where NAME appears.
+    Callgraph(CallgraphArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct CallgraphArgs {
+    trace: PathBuf,
+    /// Drill into this function: show what it was calling at sample time.
+    #[arg(long)]
+    function: Option<String>,
+    #[arg(long, default_value_t = 10)]
+    top: usize,
+    #[arg(long)]
+    pid: Option<i64>,
+    #[arg(long)]
+    binary: Option<PathBuf>,
+    #[arg(long)]
+    dsym: Option<PathBuf>,
+    #[arg(long, value_parser = parse_u64)]
+    slide: Option<u64>,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -278,7 +305,33 @@ fn main() -> anyhow::Result<()> {
         Command::Counters(args) => run_counters(args, palette),
         Command::Record(args) => run_record(args),
         Command::Events(args) => run_events(args),
+        Command::Callgraph(args) => run_callgraph(args, palette),
     }
+}
+
+fn run_callgraph(args: CallgraphArgs, palette: Palette) -> anyhow::Result<()> {
+    let bundle = TraceBundle::open(&args.trace).context("opening trace bundle")?;
+    let binary = match args.binary {
+        Some(b) => Some(b),
+        None => infer_binary_from_toc(&bundle).unwrap_or(None),
+    };
+    let mut builder = CallgraphBuilder::new(&bundle)
+        .top(args.top)
+        .binary(binary)
+        .dsym(args.dsym)
+        .slide(slide_mode(args.slide))
+        .function(args.function);
+    if let Some(pid) = args.pid {
+        builder = builder.pid(Pid::new(pid));
+    }
+    let report = builder.run().context("building callgraph report")?;
+    if args.json {
+        serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
+        println!();
+    } else {
+        print!("{}", report.to_text(palette));
+    }
+    Ok(())
 }
 
 fn slide_mode(slide: Option<u64>) -> SlideMode {
