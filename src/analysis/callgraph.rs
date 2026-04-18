@@ -96,7 +96,7 @@ impl<'a> CallgraphBuilder<'a> {
         // PCs across thousands of stacks.
         //
         // We use `symbol_at` (binary-symbol lookup) instead of
-        // `resolve` (DWARF inlining-aware) — for stack-frame analysis we
+        // `resolve` (DWARF inlining-aware) - for stack-frame analysis we
         // want the *concrete* function the PC lives in, not the
         // innermost inlined source function. Resolving via DWARF would
         // attribute every PC where `Vec::len` was inlined to "Vec::len",
@@ -197,7 +197,7 @@ impl<'a> CallgraphBuilder<'a> {
     {
         // For each stack, find the *deepest* (closest-to-root) position
         // of `needle`. The "callee" is the frame one closer to the leaf
-        // — i.e. what `needle` was calling at the moment of the sample.
+        // - i.e. what `needle` was calling at the moment of the sample.
         // If `needle` IS the leaf, it has no callee in this sample.
         let mut counts: HashMap<String, u64> = HashMap::new();
         let mut matched_samples: u64 = 0;

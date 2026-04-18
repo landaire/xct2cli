@@ -90,7 +90,7 @@ enum Command {
 
     /// Top-N hottest functions across the whole trace (inclusive
     /// samples, like a flamegraph bar's width). With `--function NAME`,
-    /// instead show the top callees of that function — the next-deeper
+    /// instead show the top callees of that function - the next-deeper
     /// frame in stacks where NAME appears.
     Callgraph(CallgraphArgs),
 }

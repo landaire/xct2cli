@@ -37,7 +37,7 @@ Global flags: `--color {auto,always,never}` (auto-detect TTY + honor
 machine-readable output. ASLR slide is recovered automatically from
 the trace's kdebug image-load events whenever `--binary` is provided;
 `xct2cli slide` is the escape hatch when that fails. `<binary>.dSYM`
-next to the binary is picked up automatically — pass `--dsym` only for
+next to the binary is picked up automatically - pass `--dsym` only for
 non-standard layouts.
 
 ## Time profile (Time Profiler trace)
@@ -113,7 +113,7 @@ xct2cli hotspots /tmp/run.trace --filter lzxc:: --top 5
 
 ### Callgraph: flamegraph-style top-down view
 
-Inclusive samples (function appears anywhere in the stack — bar width
+Inclusive samples (function appears anywhere in the stack - bar width
 in a flamegraph):
 
 ```sh
@@ -153,7 +153,7 @@ callees of encode_chunk  (495 samples)
 ### Annotate: per-instruction view with source
 
 `callgraph` works on stack-walked frames, so functions that were
-inlined into their caller are *invisible* — kperf only saw one stack
+inlined into their caller are *invisible* - kperf only saw one stack
 frame for the whole inline chain. To see source-level inlined callees
 of a function, use `annotate` instead:
 
@@ -190,10 +190,10 @@ For literal cache miss attribution you need a `.tracetemplate`
 configured for PMI-overflow sampling on a memory event. Two are
 checked in under `templates/`:
 
-- `templates/L1D_Miss.tracetemplate` — Apple's Guided "L1D Miss
+- `templates/L1D_Miss.tracetemplate` - Apple's Guided "L1D Miss
   Sampling" mode. Captures `l1d_load_miss`, `l1d_store_miss`,
   `l1d_tlb_miss` events with full callstacks at the PMI overflow.
-- `templates/l2_miss.tracetemplate` — Manual mode sampling
+- `templates/l2_miss.tracetemplate` - Manual mode sampling
   `PL2_CACHE_MISS_LD` (Apple Silicon's per-cluster L2). Manual mode
   doesn't capture per-PMI callstacks, so PCs are recovered by joining
   each PMI sample to the nearest `time-sample` row from the
@@ -247,7 +247,7 @@ In color:
 ![L1D miss interleaved view](img/l1d_miss.png)
 
 In this trace, 931 of 2124 L1D load misses (44%) come from a single
-`prev[c_rel]` read in `find_best_match` at `match_finder.rs:278` — the
+`prev[c_rel]` read in `find_best_match` at `match_finder.rs:278` - the
 hash-chain walk that the compiler inlined into `MatchFinder::process`.
 
 ## Adding new templates
@@ -256,12 +256,12 @@ hash-chain walk that the compiler inlined into `MatchFinder::process`.
 sampling mode (e.g. branch-mispredict, store-buffer-stall) needs a
 `.tracetemplate` built once in Instruments.app:
 
-1. New Document → Blank → add **CPU Counters** instrument.
+1. New Document -> Blank -> add **CPU Counters** instrument.
 2. Configuration **Manual**, Sample By **Events**, pick the Sampling
    Event, set Sample Every (start at 1M; lower if samples are sparse).
 3. Add a **Time Profiler** instrument with **High Frequency Sampling**
    on so PMI samples can be joined to a PC.
-4. File → Save as Template → put it in `templates/`.
+4. File -> Save as Template -> put it in `templates/`.
 
 `xct2cli events <trace>` will show whatever event name Apple wrote
 into the trace; `--event NAME` works the same as for the bundled

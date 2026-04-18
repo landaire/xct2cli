@@ -275,7 +275,7 @@ fn annotation_suffix(
         out.push_str(&format!(
             "{}",
             pal.dim().style(format!(
-                "[→ {}:{}]",
+                "[-> {}:{}]",
                 super::annotate::short_path(file),
                 line
             ))

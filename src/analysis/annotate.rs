@@ -75,7 +75,7 @@ pub struct AnnotatedInstruction {
     /// Outer call sites that inlined this code, closest-out first.
     pub inlined_into: Vec<InlinedFrame>,
     /// PC of a recent load whose write feeds a register this instruction
-    /// reads. Heuristic — Apple Silicon OoO can stall on a different load
+    /// reads. Heuristic - Apple Silicon OoO can stall on a different load
     /// than the most-recent producer, but for memory-bound code this is
     /// usually the right one. Explains why ALU ops show hot when the
     /// actual miss is two instructions upstream.

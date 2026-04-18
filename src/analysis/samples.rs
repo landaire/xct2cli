@@ -81,7 +81,7 @@ impl TraceBundle {
 
     /// Full per-sample callstacks from `time-sample` (running-state
     /// rows only). One `Callstack` per row; identical stacks are NOT
-    /// deduped — the caller can aggregate as needed.
+    /// deduped - the caller can aggregate as needed.
     pub fn callstacks(&self, pid: Option<Pid>) -> Result<Vec<Callstack>> {
         let xml = self
             .xctrace()

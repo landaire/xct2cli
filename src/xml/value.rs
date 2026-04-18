@@ -5,7 +5,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind")]
 pub enum Cell {
-    /// `<sentinel/>` — schema column present but no value for this row.
+    /// `<sentinel/>` - schema column present but no value for this row.
     Sentinel,
     Leaf(LeafCell),
     Composite(CompositeCell),

@@ -38,7 +38,7 @@ pub struct Symbolicator {
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolicatedFrame {
     pub address: RuntimePc,
-    /// The deepest-inlined function this PC actually belongs to — i.e.
+    /// The deepest-inlined function this PC actually belongs to - i.e.
     /// the source the compiler labels the instruction as coming from.
     pub function: Option<String>,
     pub file: Option<String>,
@@ -71,7 +71,7 @@ impl Symbolicator {
 
     /// The binary's symbol-table name for this PC (`addr2line::Loader::find_symbol_info`).
     /// Unlike `resolve`, this returns the *concrete* binary function
-    /// containing the PC — not the deepest-inlined source function. Use
+    /// containing the PC - not the deepest-inlined source function. Use
     /// for stack-frame analysis where you want the real call frame.
     pub fn symbol_at(&self, runtime_pc: RuntimePc) -> Option<String> {
         let loader = self.loader.as_ref()?;
@@ -311,7 +311,7 @@ pub struct SlideCandidate {
 impl TraceBundle {
     /// Read every `DBG_DYLD_UUID_MAP_A` event from the trace and decode
     /// the (UUID, runtime load address) pairs. These events are kernel
-    /// ground truth — when dyld maps an image, the kernel records the
+    /// ground truth - when dyld maps an image, the kernel records the
     /// runtime base address it chose under ASLR.
     pub fn image_loads(&self) -> Result<Vec<ImageLoad>> {
         let xml = self.xctrace().export_xpath(self.path(), DBG_DYLD_XPATH)?;

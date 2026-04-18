@@ -1,9 +1,9 @@
 //! PMI-overflow sampling.
 //!
 //! Two surfaces:
-//! - `SamplingModeSamples` (Guided-mode templates like L1D Miss Sampling) —
+//! - `SamplingModeSamples` (Guided-mode templates like L1D Miss Sampling) -
 //!   each row carries event name, PC, and inline backtrace.
-//! - `counters-profile` (Manual-mode templates) — rows have no per-sample
+//! - `counters-profile` (Manual-mode templates) - rows have no per-sample
 //!   callstack, so PCs are recovered by joining each PMI timestamp to the
 //!   nearest `time-sample` row from a co-recorded Time Profiler.
 
@@ -142,7 +142,7 @@ impl TraceBundle {
     }
 
     /// Read the `pmi-event` attribute from the trace's `counters-profile`
-    /// table — i.e. the event the Manual-mode template was configured to
+    /// table - i.e. the event the Manual-mode template was configured to
     /// sample on. Returns `None` if no such table exists.
     pub fn counters_profile_event(&self) -> Result<Option<String>> {
         let toc = self.toc()?;
