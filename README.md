@@ -177,7 +177,7 @@ followed by an `annotate-snippets` block per source file showing the
 hot lines in context (hot-line clusters more than `2 * --context` lines
 apart split into separate snippets):
 
-![Default annotate output: asm with sample heat bar + source snippets](img/instructions_mode.png)
+![Default annotate output: asm with sample heat bar + source snippets](https://raw.githubusercontent.com/landaire/xct2cli/main/img/instructions_mode.png)
 
 `--mode source` collapses to just the `annotate-snippets` source-line
 callouts.
@@ -244,7 +244,7 @@ function: lzxc::match_finder::MatchFinder::process (2124 l1d_load_miss samples i
 
 In color:
 
-![L1D miss interleaved view](img/l1d_miss.png)
+![L1D miss interleaved view](https://raw.githubusercontent.com/landaire/xct2cli/main/img/l1d_miss.png)
 
 In this trace, 931 of 2124 L1D load misses (44%) come from a single
 `prev[c_rel]` read in `find_best_match` at `match_finder.rs:278` - the

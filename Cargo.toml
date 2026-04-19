@@ -2,10 +2,29 @@
 name = "xct2cli"
 version = "0.1.0"
 edition = "2024"
-description = "Library and CLI for transforming Xcode Instruments traces (Apple Silicon)."
+rust-version = "1.85"
+authors = ["Lander Brandt <landerbrandt@gmail.com>"]
+description = "Library and CLI for transforming Xcode Instruments .trace bundles (hotspots, callgraphs, annotated disassembly, PMI counters, heap allocations). Apple Silicon."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/landaire/xct2cli"
+homepage = "https://github.com/landaire/xct2cli"
+documentation = "https://docs.rs/xct2cli"
 readme = "README.md"
+keywords = ["instruments", "xctrace", "profiling", "macos", "trace"]
+categories = [
+    "command-line-utilities",
+    "development-tools::profiling",
+]
+# Keep the published tarball lean - screenshots are only useful when the
+# README renders on GitHub, where relative links resolve against the repo.
+# On crates.io they're served via absolute GitHub URLs (see README.md).
+exclude = [
+    "img/**",
+    ".jj/**",
+    ".claude/**",
+    "mise.toml",
+    ".DS_Store",
+]
 
 [features]
 default = ["cli"]
